@@ -17,16 +17,18 @@ import (
 	"decentralized-api/payloadstorage"
 	"decentralized-api/poc"
 	"decentralized-api/poc/artifacts"
+	"decentralized-api/poc/earlyshare"
+	"decentralized-api/statsstorage"
 	"net"
 
-	"github.com/productscience/inference/api/inference/inference"
+	nmgen "common/nodemanager/gen"
+	"decentralized-api/nodemanager"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
-	"decentralized-api/internal/validation"
-	"decentralized-api/logging"
+	"common/logging"
 	"decentralized-api/participant"
-	"decentralized-api/training"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -39,14 +41,44 @@ import (
 	"github.com/productscience/inference/x/inference/types"
 )
 
+// buildEarlyShareGuard constructs the DAPI-only early-share guard from config.
+// Returns nil (a valid disabled guard) when disabled or when the local sqlite
+// database is unavailable.
+func buildEarlyShareGuard(configManager *apiconfig.ConfigManager) *poc.EarlyShareGuard {
+	esgCfg := configManager.GetEarlyShareGuardConfig()
+	cfg := earlyshare.Config{
+		Mode:                  earlyshare.Mode(esgCfg.Mode),
+		FirstFraction:         esgCfg.FirstFraction,
+		ThresholdRatio:        esgCfg.ThresholdRatio,
+		RequireInclusionProof: esgCfg.RequireInclusionProof,
+		InclusionSampleSize:   esgCfg.InclusionSampleSize,
+	}.Normalized()
+	if !cfg.Enabled() {
+		return nil
+	}
+
+	sqlDb := configManager.SqlDb()
+	if sqlDb == nil || sqlDb.GetDb() == nil {
+		logging.Warn("Early-share guard enabled but sqlite db unavailable; disabling", types.PoC)
+		return nil
+	}
+
+	store := earlyshare.NewStore(sqlDb.GetDb())
+	if err := store.EnsureSchema(context.Background()); err != nil {
+		logging.Error("Failed to initialize early-share guard schema; disabling", types.PoC, "error", err)
+		return nil
+	}
+	return poc.NewEarlyShareGuard(cfg, store)
+}
+
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "status" {
 		logging.WithNoopLogger(func() (interface{}, error) {
-			config, err := apiconfig.LoadDefaultConfigManager()
+			configManager, err := apiconfig.LoadDefaultConfigManager()
 			if err != nil {
 				log.Fatalf("Error loading config: %v", err)
 			}
-			returnStatus(config)
+			returnStatus(configManager)
 			return nil, nil
 		})
 
@@ -56,16 +88,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	config, err := apiconfig.LoadDefaultConfigManager()
+	configManager, err := apiconfig.LoadDefaultConfigManager()
 	if err != nil {
 		log.Fatalf("Error loading config: %v", err)
 	}
 
-	if config.GetApiConfig().TestMode {
+	if configManager.GetApiConfig().TestMode {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
 	}
 
-	natssrv := server.NewServer(config.GetNatsConfig())
+	natssrv := server.NewServer(configManager.GetNatsConfig())
 	if err := natssrv.Start(); err != nil {
 		panic(err)
 	}
@@ -75,7 +107,7 @@ func main() {
 		"gonka",
 		20,
 		5*time.Second,
-		config,
+		configManager,
 	)
 	if err != nil {
 		panic(err)
@@ -84,7 +116,7 @@ func main() {
 	// Version sync is handled later in the event processing loop when blockchain is fully ready
 	// This prevents EOF errors during startup from breaking the entire application
 
-	chainPhaseTracker := chainphase.NewChainPhaseTracker()
+	chainPhaseTracker := &chainphase.ChainPhaseTracker{}
 	// NOTE: getParams is waiting for rpc to be ready, don't add request before it
 	params, err := getParams(context.Background(), *recorder)
 	if err != nil {
@@ -98,10 +130,10 @@ func main() {
 		logging.Error("Failed to get participant info", types.Participants, "error", err)
 		return
 	}
-	chainBridge := broker.NewBrokerChainBridgeImpl(recorder, config.GetChainNodeConfig().Url)
-	nodeBroker := broker.NewBroker(chainBridge, chainPhaseTracker, participantInfo, config.GetApiConfig().PoCCallbackUrl, &mlnodeclient.HttpClientFactory{}, config)
+	chainBridge := broker.NewBrokerChainBridgeImpl(recorder, configManager.GetChainNodeConfig().Url)
+	nodeBroker := broker.NewBroker(chainBridge, chainPhaseTracker, participantInfo, configManager.GetApiConfig().PoCCallbackUrl, &mlnodeclient.HttpClientFactory{}, configManager)
 
-	nodes := config.GetNodes()
+	nodes := configManager.GetNodes()
 	for _, node := range nodes {
 		responseChan := nodeBroker.LoadNodeToBroker(&node)
 		if responseChan != nil {
@@ -116,49 +148,90 @@ func main() {
 		}
 	}
 
-	if err := participant.RegisterParticipantIfNeeded(recorder, config); err != nil {
+	if err := participant.RegisterParticipantIfNeeded(recorder, configManager); err != nil {
 		logging.Error("Failed to register participant", types.Participants, "error", err)
 		return
 	}
 
-	logging.Debug("Initializing PoC orchestrator",
+	logging.Debug("Initializing PoC off-chain validator",
 		types.PoC, "name", recorder.GetApiAccount().SignerAccount.Name,
 		"address", participantInfo.GetAddress(),
 		"pubkey", participantInfo.GetPubKey())
 
-	// Create v2 orchestrator for artifact-based PoC
-	pocOrchestrator := poc.NewOrchestrator(
+	// DAPI-only early-share guard (disabled by default). When enabled it reuses
+	// the embedded sqlite db for local persistence. See
+	// proposals/poc/early-share-guard-dapi.md.
+	earlyGuard := buildEarlyShareGuard(configManager)
+
+	// Shared managed artifact store for off-chain PoC (used by the validator,
+	// commit worker, and the mlnode/public servers). Manages per-height
+	// directories with automatic pruning (retains last 10). Created before the
+	// validator so the event listener never observes a partially wired validator.
+	artifactStore := artifacts.NewManagedArtifactStore("/root/.dapi/data/poc-artifacts", 10)
+	defer artifactStore.Close()
+
+	// Prune early-share guard checkpoints on the same stage cadence as artifacts.
+	if earlyGuard.Enabled() {
+		artifactStore.AddPruneHook(func(stage int64) {
+			earlyGuard.DeleteStage(context.Background(), stage)
+		})
+	}
+
+	offChainValidator := poc.NewOffChainValidator(
+		recorder,
+		nodeBroker,
+		chainPhaseTracker,
+		configManager.GetApiConfig().PoCCallbackUrl,
 		participantInfo.GetPubKey(),
 		participantInfo.GetAddress(),
-		nodeBroker,
-		config.GetApiConfig().PoCCallbackUrl,
-		config.GetChainNodeConfig().Url,
-		recorder,
-		chainPhaseTracker,
+		configManager.GetChainNodeConfig().Url,
+		poc.DefaultValidationConfig(),
+		earlyGuard,
+		artifactStore,
 	)
-	logging.Info("PoC orchestrator initialized", types.PoC)
+	logging.Info("PoC off-chain validator initialized", types.PoC, "earlyShareGuardEnabled", earlyGuard.Enabled())
 
-	tendermintClient := cosmosclient.TendermintClient{
-		ChainNodeUrl: config.GetChainNodeConfig().Url,
-	}
 	// Create a cancellable context for the entire system
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // Ensure resources are cleaned up
 
 	// Start periodic config auto-flush of dynamic data to DB
-	config.StartAutoFlush(ctx, 60*time.Second)
+	configManager.StartAutoFlush(ctx, 60*time.Second)
 
-	training.NewAssigner(recorder, &tendermintClient, ctx)
-	trainingExecutor := training.NewExecutor(ctx, nodeBroker, recorder)
+	// Optional off-chain inference stats storage (PostgreSQL-backed when PGHOST is configured).
+	statsStore, err := statsstorage.NewStatsStorage(ctx)
+	if err != nil {
+		logging.Error("Failed to initialize stats storage", types.System, "error", err)
+		return
+	}
+	if statsStore != nil {
+		defer statsStore.Close()
+	}
 
-	validator := validation.NewInferenceValidator(nodeBroker, config, recorder, chainPhaseTracker)
 	blsManager := bls.NewBlsManager(*recorder)
-	listener := event_listener.NewEventListener(config, pocOrchestrator, nodeBroker, validator, *recorder, trainingExecutor, chainPhaseTracker, cancel, blsManager)
-	// TODO: propagate trainingExecutor
+	if db := configManager.SqlDb().GetDb(); db != nil {
+		if err := blsManager.SetDealerOpeningsDB(db); err != nil {
+			logging.Warn("Failed to initialize dealer openings persistence", types.BLS, "error", err)
+		}
+	}
+	hostEventRing := apiconfig.NewHostEventRing(0, uint64(time.Now().UnixNano()))
+	escrowLoadTracker := broker.NewEscrowLoadTracker(0)
+	listener := event_listener.NewEventListener(
+		configManager,
+		offChainValidator,
+		nodeBroker,
+		*recorder,
+		chainPhaseTracker,
+		cancel,
+		blsManager,
+		event_listener.WithStatsStorage(statsStore),
+		event_listener.WithHostEventRing(hostEventRing),
+		event_listener.WithEscrowQuerier(event_listener.NewChainEscrowQuerier(recorder)),
+	)
 	go listener.Start(ctx)
 
 	mlnodeBackgroundManager := modelmanager.NewMLNodeBackgroundManager(
-		config,
+		configManager,
 		chainPhaseTracker,
 		nodeBroker,
 		&mlnodeclient.HttpClientFactory{},
@@ -166,11 +239,11 @@ func main() {
 	)
 	go mlnodeBackgroundManager.Start(ctx)
 
-	addr := fmt.Sprintf(":%v", config.GetApiConfig().PublicServerPort)
+	addr := fmt.Sprintf(":%v", configManager.GetApiConfig().PublicServerPort)
 	logging.Info("start public server on addr", types.Server, "addr", addr)
 
 	// Bridge external block queue
-	blockQueue := pserver.NewBlockQueue(recorder)
+	blockQueue := pserver.NewBlockQueue(recorder, configManager.SqlDb().GetDb())
 
 	// Shared payload storage for both public and admin servers
 	// Uses PostgreSQL if PGHOST is set and accessible, otherwise file-based
@@ -181,51 +254,60 @@ func main() {
 		3*time.Minute, // cache TTL
 	)
 
-	// Shared managed artifact store for off-chain PoC (used by both mlnode and public servers)
-	// Manages per-height directories with automatic pruning (retains last 10)
-	artifactStore := artifacts.NewManagedArtifactStore("/root/.dapi/data/poc-artifacts", 10)
-	defer artifactStore.Close()
-
 	// Create commit worker for time-based artifact commits and weight distribution
 	// Worker owns flush lifecycle, commits periodically (not per-request), and handles distribution
-	batchingCfg := config.GetTxBatchingConfig()
+	batchingCfg := configManager.GetTxBatchingConfig()
 	commitInterval := time.Duration(batchingCfg.PocCommitIntervalSeconds) * time.Second
 	commitWorker := poc.NewCommitWorker(artifactStore, recorder, chainPhaseTracker, participantInfo.GetAddress(), commitInterval)
 	defer commitWorker.Close()
 
-	publicServer := pserver.NewServer(nodeBroker, config, recorder, trainingExecutor, blockQueue, chainPhaseTracker, payloadStore, pserver.WithArtifactStore(artifactStore))
+	publicServer := pserver.NewServer(
+		nodeBroker,
+		configManager,
+		recorder,
+		blockQueue,
+		chainPhaseTracker,
+		payloadStore,
+		pserver.WithArtifactStore(artifactStore),
+		pserver.WithStatsStorage(statsStore),
+	)
+
 	publicServer.Start(addr)
 
-	addr = fmt.Sprintf(":%v", config.GetApiConfig().MLServerPort)
+	addr = fmt.Sprintf(":%v", configManager.GetApiConfig().MLServerPort)
 	logging.Info("start ml server on addr", types.Server, "addr", addr)
-	mlServer := mlserver.NewServer(recorder, nodeBroker, mlserver.WithArtifactStore(artifactStore))
+	mlServer := mlserver.NewServer(recorder, nodeBroker, mlserver.WithArtifactStore(artifactStore), mlserver.WithConfigManager(configManager))
 	mlServer.Start(addr)
 
-	addr = fmt.Sprintf(":%v", config.GetApiConfig().AdminServerPort)
+	addr = fmt.Sprintf(":%v", configManager.GetApiConfig().AdminServerPort)
 	logging.Info("start admin server on addr", types.Server, "addr", addr)
-	adminServer := adminserver.NewServer(recorder, nodeBroker, config, validator, blockQueue, payloadStore)
+	adminServer := adminserver.NewServer(recorder, nodeBroker, configManager, blockQueue, payloadStore)
 	adminServer.Start(addr)
 
-	mlGrpcServerPort := config.GetApiConfig().MlGrpcServerPort
-	if mlGrpcServerPort == 0 {
-		mlGrpcServerPort = 9300
-		logging.Info("ml grpc server port not set, using default port 9300", types.Server)
+	nmGrpcPort := configManager.GetApiConfig().NodeManagerGrpcPort
+	if nmGrpcPort == 0 {
+		nmGrpcPort = 9400
 	}
-	addr = fmt.Sprintf(":%v", mlGrpcServerPort)
-	logging.Info("start training server on addr", types.Server, "addr", addr)
-	grpcServer := grpc.NewServer()
-	trainingServer := training.NewServer(recorder, trainingExecutor)
-	inference.RegisterNetworkNodeServiceServer(grpcServer, trainingServer)
-	reflection.Register(grpcServer)
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
-	}
-	go func() {
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("failed to serve: %v", err)
+	// Negative ports explicitly disable the NodeManager gRPC server.
+	if nmGrpcPort > 0 {
+		nmGrpcServer := grpc.NewServer()
+		nmgen.RegisterNodeManagerServer(nmGrpcServer, nodemanager.NewServer(nodeBroker, configManager, chainPhaseTracker,
+			nodemanager.WithHostEventRing(hostEventRing),
+			nodemanager.WithEscrowLoadTracker(escrowLoadTracker),
+		))
+		reflection.Register(nmGrpcServer)
+		nodeManagerAddr := fmt.Sprintf(":%v", nmGrpcPort)
+		nmLis, err := net.Listen("tcp", nodeManagerAddr)
+		if err != nil {
+			log.Fatalf("node manager failed to listen on %v: %v", nodeManagerAddr, err)
 		}
-	}()
+		go func() {
+			logging.Info("start node manager gRPC server", types.Server, "nodeManagerAddr", nodeManagerAddr)
+			if err := nmGrpcServer.Serve(nmLis); err != nil {
+				log.Fatalf("node manager gRPC server failed: %v", err)
+			}
+		}()
+	}
 
 	logging.Info("Servers started", types.Server, "addr", addr)
 
@@ -234,18 +316,18 @@ func main() {
 	ctxFlush, cancelFlush := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelFlush()
 	logging.Info("Flushing config to the DB on app exit", types.Config)
-	_ = config.FlushNow(ctxFlush)
+	_ = configManager.FlushNow(ctxFlush)
 
 	// Close DB gracefully
-	if db := config.SqlDb().GetDb(); db != nil {
+	if db := configManager.SqlDb().GetDb(); db != nil {
 		_ = db.Close()
 	}
 
 	os.Exit(1) // Exit with an error for cosmovisor to restart the process
 }
 
-func returnStatus(config *apiconfig.ConfigManager) {
-	height := config.GetHeight()
+func returnStatus(configManager *apiconfig.ConfigManager) {
+	height := configManager.GetHeight()
 	status := map[string]interface{}{
 		"sync_info": map[string]string{
 			"latest_block_height": strconv.FormatInt(height, 10),

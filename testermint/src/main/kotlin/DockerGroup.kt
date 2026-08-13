@@ -2,7 +2,6 @@ package com.productscience
 
 import com.github.dockerjava.api.DockerClient
 import com.github.dockerjava.core.DockerClientBuilder
-import com.productscience.Consumer.Companion.create
 import com.productscience.data.AppState
 import com.productscience.data.Spec
 import com.productscience.data.UnfundedInferenceParticipant
@@ -22,22 +21,105 @@ import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
 
 const val GENESIS_KEY_NAME = "genesis"
+
+private const val VERSIOND_COMPOSE_FILE = "docker-compose.versiond.yml"
+
+/**
+ * Docker platform for versiond + devshardd override binaries.
+ * Mirrors [scripts/blst-portable.sh] so Apple Silicon runs linux/arm64 everywhere.
+ */
+internal fun resolveDockerPlatform(): String {
+    System.getenv("DOCKER_PLATFORM")?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    if (!System.getProperty("os.name").contains("Mac", ignoreCase = true)) {
+        return "linux/amd64"
+    }
+    return runCatching {
+        val proc =
+            ProcessBuilder("sysctl", "-n", "hw.optional.arm64")
+                .redirectErrorStream(true)
+                .start()
+        val arm64 = proc.inputStream.bufferedReader().readText().trim()
+        proc.waitFor()
+        if (proc.exitValue() == 0 && arm64 == "1") "linux/arm64" else "linux/amd64"
+    }.getOrDefault("linux/amd64")
+}
+
+/** True when this pair's compose stack includes the versiond overlay (devshardd / VersiondTests). */
+private fun DockerGroup.usesVersiondOverlay(): Boolean =
+    composeFiles.any { it.endsWith(VERSIOND_COMPOSE_FILE) }
+
+/**
+ * Retry container lookup with exponential backoff.
+ * Docker containers may not be immediately visible after `docker compose up`.
+ */
+fun retryGetCli(config: ApplicationConfig, pairName: String, maxAttempts: Int = 5): ApplicationCLI {
+    var delay = 2000L // start at 2s
+    for (attempt in 1..maxAttempts) {
+        val containers = getRawContainers(config)
+        val cli = containers.getCli(pairName)
+        if (cli != null) return cli
+        if (attempt < maxAttempts) {
+            Logger.warn("Container not found for keyName={}, retrying in {}ms (attempt {}/{})", pairName, delay, attempt, maxAttempts)
+            Thread.sleep(delay)
+            delay = (delay * 2).coerceAtMost(15000L)
+        }
+    }
+    error("Could not find node container for keyName=$pairName after $maxAttempts attempts")
+}
 const val LOCAL_TEST_NET_DIR = "local-test-net"
-val DNS_COMPOSE_FILES = listOf(
-    "$LOCAL_TEST_NET_DIR/docker-compose.dns.yml",
-    "$LOCAL_TEST_NET_DIR/docker-compose.dns-overrides.yml",
-)
+/** CoreDNS with fixed IP 172.25.0.10 — owned by long-lived compose project [SHARED_DNS_PROJECT]. */
+private const val DNS_SERVER_COMPOSE_FILE = "$LOCAL_TEST_NET_DIR/docker-compose.dns.yml"
+/** Points pair services at 172.25.0.10 without declaring the test-dns container. */
+private const val DNS_OVERRIDES_COMPOSE_FILE = "$LOCAL_TEST_NET_DIR/docker-compose.dns-overrides.yml"
+/** Kept for callers that want both dns server + overrides; genesis/join use overrides only. */
+val DNS_COMPOSE_FILES = listOf(DNS_SERVER_COMPOSE_FILE, DNS_OVERRIDES_COMPOSE_FILE)
+/** Separate from genesis/join so pair `compose down` does not kill CoreDNS between tests. */
+private const val SHARED_DNS_PROJECT = "testdns"
+private const val TEST_DNS_IPV4 = "172.25.0.10"
 val BASE_COMPOSE_FILES = listOf(
     "${LOCAL_TEST_NET_DIR}/docker-compose-base.yml",
-    "${LOCAL_TEST_NET_DIR}/docker-compose.proxy.yml"
 )
-val GENESIS_COMPOSE_FILES = BASE_COMPOSE_FILES + "${LOCAL_TEST_NET_DIR}/docker-compose.genesis.yml" + DNS_COMPOSE_FILES
-val NODE_COMPOSE_FILES = BASE_COMPOSE_FILES + "${LOCAL_TEST_NET_DIR}/docker-compose.join.yml" + DNS_COMPOSE_FILES
+
+// Genesis-only overlay that exposes its postgres host port for JDBC asserts.
+// Join pairs keep their postgres reachable only from chain-public.
+private val POSTGRES_HOST_OVERLAY = listOf("$LOCAL_TEST_NET_DIR/docker-compose.postgres.yml")
+
+// Ephemeral services stopped on reboot. Shared test-dns stays up; postgres
+// services are reset separately so payload/diff DBs cannot leak across tests.
+private val PAIR_EPHEMERAL_SERVICES = listOf(
+    "proxy",
+    "edge-api",
+    "api",
+    "mock-server",
+    "chain-node",
+    "versiond",
+    "versiond-2",
+    "versiond-3",
+    "versiond-router",
+    "testapp-server",
+    "devshardd-artifact-server",
+)
+
+/** Pair + shared-devshard Postgres — stop/rm + drop named volumes on every reboot. */
+private val PAIR_POSTGRES_SERVICES = listOf(
+    "postgres",
+    "devshard-postgres",
+)
+
+val GENESIS_COMPOSE_FILES = BASE_COMPOSE_FILES +
+    "${LOCAL_TEST_NET_DIR}/docker-compose.genesis.yml" +
+    DNS_OVERRIDES_COMPOSE_FILE +
+    POSTGRES_HOST_OVERLAY
+// Joins use dns-overrides only. Declaring test-dns in every pair's compose set made
+// three projects fight over container_name=test-dns / 172.25.0.10 on reboot.
+val NODE_COMPOSE_FILES = BASE_COMPOSE_FILES +
+    "${LOCAL_TEST_NET_DIR}/docker-compose.join.yml" +
+    DNS_OVERRIDES_COMPOSE_FILE
 
 data class GenesisUrls(val keyName: String) {
     val apiUrl = "http://$keyName-api:9000"
     val rpcUrl = "http://$keyName-node:26657"
-    val p2pUrl = "http://$keyName-node:26656"
+    val p2pUrl = "tcp://$keyName-node:26656"
 }
 
 data class DockerGroup(
@@ -47,6 +129,7 @@ data class DockerGroup(
     val mlPort: Int,
     val adminPort: Int,
     val natsPort: Int,
+    val nodeManagerGrpcPort: Int,
     val nodeConfigFile: String,
     val isGenesis: Boolean = false,
     val mockExternalPort: Int,
@@ -56,11 +139,16 @@ data class DockerGroup(
     val workingDirectory: String,
     val genesisGroup: GenesisUrls? = null,
     val genesisOverridesFile: String,
-    val publicUrl: String = "http://$pairName-api:9000",
+    // publicUrl is what dapi registers on chain as its participant.inference_url.
+    // Mirrors production: chain points at the per-pair proxy, which routes
+    // /devshard/<version>/* to versiond when configured.
+    val publicUrl: String = "http://$pairName-proxy",
+    // pocCallbackUrl stays direct -- it's an internal mlnode -> dapi callback
+    // on the ML server port, never routed through nginx.
     val pocCallbackUrl: String = "http://$pairName-api:9100",
     val config: ApplicationConfig,
     val useSnapshots: Boolean,
-    val p2pExternalAddress: String = "http://$pairName-node:26656",
+    val p2pExternalAddress: String = "$pairName-node:26656",
 ) {
     val warmKeyName = "$pairName-WARM"
     val coldKeyName = pairName
@@ -102,8 +190,8 @@ data class DockerGroup(
             .also { it.environment().putAll(getCommonEnvMap(useSnapshots)) }
             .start()
 
-        val output = process.inputStream.bufferedReader().readText()
-        val errorOutput = process.errorStream.bufferedReader().readText()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+        val errorOutput = process.errorStream.bufferedReader().use { it.readText() }
 
         process.waitFor()
 
@@ -131,8 +219,8 @@ data class DockerGroup(
             .also { it.environment().putAll(getCommonEnvMap(useSnapshots)) }
             .start()
 
-        val output = process.inputStream.bufferedReader().readText()
-        val errorOutput = process.errorStream.bufferedReader().readText()
+        val output = process.inputStream.bufferedReader().use { it.readText() }
+        val errorOutput = process.errorStream.bufferedReader().use { it.readText() }
 
         process.waitFor()
 
@@ -154,32 +242,61 @@ data class DockerGroup(
             composeArgs.addAll(listOf("-f", file))
         }
         composeArgs.addAll(listOf("--project-directory", workingDirectory))
-        composeArgs.addAll(listOf("up", "-d"))
         val baseArgs = composeArgs.toImmutableList()
-        if (!isGenesis) {
-            // This will allow us to get our consensus key and add the participant BEFORE we launch the API
-            composeArgs.add("chain-node")
+        if (isGenesis && usesVersiondOverlay()) {
+            // versiond stacks start api with chain-node in one `up -d`; api init-docker.sh
+            // often exits before genesis creates the cold key. Boot chain-node first, then
+            // the rest. Default genesis tests (no versiond overlay) keep the original path.
+            Logger.info("Genesis + versiond overlay: starting chain-node before full stack", "")
+            // --force-recreate: guarantee a fresh node even if a stale container survived
+            // teardown; reusing one against freshly-wiped prod-local panics on cs.wal.
+            val nodeExit = runComposeLogged(
+                "genesis-chain-node-up",
+                *(baseArgs + listOf("up", "-d", "--force-recreate", "chain-node")).toTypedArray(),
+            )
+            if (nodeExit != 0) {
+                logComposeProjectState("after-failed-genesis-chain-node-up")
+                logInferenceStackContainers(pairName, "after-failed-genesis-chain-node-up")
+                error("[$pairName] genesis chain-node compose up exited $nodeExit")
+            }
+            waitForColdKeyInNodeContainer()
+            coldAccountPubkey = extractColdPubkeyFromNodeContainer()
+            Logger.info("Genesis cold ACCOUNT_PUBKEY extracted for api startup", "")
+            bringUpGenesisFullStack(baseArgs)
+        } else {
+            composeArgs.addAll(listOf("up", "-d"))
+            if (!isGenesis) {
+                // This will allow us to get our consensus key and add the participant BEFORE we launch the API.
+                // --force-recreate: never reuse a stale node against freshly-wiped prod-local (cs.wal panic).
+                composeArgs.addAll(listOf("--force-recreate", "chain-node"))
+            }
+            if (!isGenesis) {
+                val exitCode = runComposeLogged("join-chain-node-up", *composeArgs.toTypedArray())
+                if (exitCode != 0) {
+                    logComposeProjectState("after-failed-chain-node-up")
+                    logInferenceStackContainers(pairName, "after-failed-chain-node-up")
+                }
+            } else {
+                bringUpGenesisFullStack(baseArgs)
+            }
         }
-        val dockerProcess = dockerProcess(*composeArgs.toTypedArray())
-        val process = dockerProcess.start()
-        process.inputStream.bufferedReader().lines().forEach { Logger.info(it, "") }
-        process.errorStream.bufferedReader().lines().forEach { Logger.info(it, "") }
-        process.waitFor()
         if (!isGenesis) {
             Thread.sleep(Duration.ofSeconds(10))
 
-            val containers = getRawContainers(config)
-            val node =
-                containers.getCli(this.pairName) ?: error("Could not find node container for keyName=${this.pairName}")
-            val validatorKey = (1..5).fold<Int, String?>(null) { acc, _ ->
-                acc ?: try {
-                    node.getValidatorInfo().key
-                } catch (e: com.google.gson.JsonSyntaxException) {
+            val node = retryGetCli(config, this.pairName)
+            val validatorDeadline = System.nanoTime() + Duration.ofSeconds(90).toNanos()
+            var validatorKey: String? = null
+            while (validatorKey == null) {
+                try {
+                    validatorKey = node.getValidatorInfo().key
+                } catch (e: Exception) {
                     Logger.warn("Validator key not yet available, waiting 5 seconds and trying again", "")
+                    if (System.nanoTime() >= validatorDeadline) {
+                        throw IllegalStateException("Failed to get validator info within 90 seconds", e)
+                    }
                     Thread.sleep(Duration.ofSeconds(5))
-                    null
                 }
-            } ?: throw IllegalStateException("Failed to get validator info after 3 attempts")
+            }
             node.registerNewParticipant(
                 publicUrl,
                 accountPubKey,
@@ -188,13 +305,67 @@ data class DockerGroup(
             )
             node.waitForNextBlock(2)
             node.grantMlOpsPermissionsToWarmAccount()
-            val startRemainingArgs = baseArgs + listOf("api", "mock-server", "proxy")
+            // Services to start after registration. edge-api is listed explicitly:
+            // proxy depends_on it, but Compose sometimes skips that dependency when
+            // starting a subset of services after chain-node is already up (reboot),
+            // which leaves join proxies 502ing on Tier A /v1/epochs/* readiness checks.
+            // Versiond is added when this pair's additional compose files include it.
+            val joinServices = mutableListOf("api", "mock-server", "edge-api", "proxy")
+            val additionalForPair = config.additionalDockerFilesByKeyName[pairName] ?: emptyList()
+            if (additionalForPair.any { it.contains("versiond") }) {
+                joinServices.add("versiond")
+            }
+            val startRemainingArgs = baseArgs + listOf("up", "-d") + joinServices
             this.coldAccountPubkey = node.getColdPubKey()
-            dockerProcess(*startRemainingArgs.toTypedArray()).start().waitFor()
+            Logger.info(
+                "[{}] Starting join inference stack after registration: {}",
+                pairName,
+                joinServices.joinToString(),
+            )
+            val stackExit = runComposeLogged(
+                "join-inference-stack-up",
+                *startRemainingArgs.toTypedArray(),
+            )
+            logComposeProjectState("after-inference-stack-up")
+            logInferenceStackContainers(pairName, "after-inference-stack-up")
+            val apiContainer = "$pairName-api"
+            if (stackExit != 0 || !dockerContainerRunning(apiContainer)) {
+                Logger.error(
+                    "[{}] {} not running after compose up (exit={}); dumping logs",
+                    pairName,
+                    apiContainer,
+                    stackExit,
+                )
+                tailDockerLogs(apiContainer, lines = 150, context = "join-api-not-running")
+                tailDockerLogs("$pairName-postgres", lines = 80, context = "join-postgres")
+                tailDockerLogs("$pairName-edge-api", lines = 80, context = "join-edge-api")
+                tailDockerLogs("$pairName-proxy", lines = 80, context = "join-proxy")
+                logProxyStackDiagnostics(pairName, "join-api-not-running")
+            }
             Thread.sleep(Duration.ofSeconds(10))
+            if (!dockerContainerRunning(apiContainer)) {
+                logComposeProjectState("after-wait-api-still-down")
+                logInferenceStackContainers(pairName, "after-wait-api-still-down")
+                logProxyStackDiagnostics(pairName, "after-wait-api-still-down")
+                error(
+                    "$apiContainer not running after join stack up (compose exit=$stackExit). " +
+                        "See testermint/logs for compose + docker log output.",
+                )
+            }
+            waitForProxyStackReady()
         }
-        // Just register the log events
-        getLocalInferencePairs(config)
+        if (isGenesis && usesVersiondOverlay()) {
+            ensureGenesisApiRunning()
+            waitForProxyStackReady()
+        }
+        // Just register the log events. Skip while versiond genesis is still settling —
+        // initializeCluster will discover pairs after RPC readiness.
+        if (!(isGenesis && usesVersiondOverlay())) {
+            if (!isGenesis) {
+                logInferenceStackContainers(pairName, "before-getLocalInferencePairs")
+            }
+            getLocalInferencePairs(config)
+        }
         print(
             "Genesis overrides file: $genesisOverridesFile | content: ${
                 Files.readString(
@@ -207,24 +378,268 @@ data class DockerGroup(
         )
     }
 
-    fun tearDownExisting() {
-        Logger.info("Tearing down existing docker group with keyName={}", pairName)
+    private fun waitForColdKeyInNodeContainer(timeout: Duration = Duration.ofMinutes(3)) {
+        val nodeContainer = "$pairName-node"
+        val keyringBackend = if (isGenesis) "test" else "file"
+        val deadline = System.nanoTime() + timeout.toNanos()
+        while (System.nanoTime() < deadline) {
+            val check = ProcessBuilder(
+                "docker", "exec", nodeContainer,
+                "inferenced", "keys", "show", coldKeyName,
+                "--keyring-backend", keyringBackend,
+                "--keyring-dir", "/root/.inference",
+            ).redirectErrorStream(true).start()
+            if (check.waitFor() == 0) {
+                Logger.info("Cold key '{}' available in {}", coldKeyName, nodeContainer)
+                return
+            }
+            Thread.sleep(Duration.ofSeconds(2))
+        }
+        error("Cold key '$coldKeyName' not found in $nodeContainer within ${timeout.seconds}s")
+    }
+
+    /** Reads the genesis cold pubkey from chain-node for ACCOUNT_PUBKEY (api init-docker.sh). */
+    private fun extractColdPubkeyFromNodeContainer(): String {
+        val nodeContainer = "$pairName-node"
+        val keyringBackend = if (isGenesis) "test" else "file"
+        val proc = ProcessBuilder(
+            "docker", "exec", nodeContainer,
+            "sh", "-c",
+            "inferenced keys show \"$coldKeyName\" --pubkey --keyring-backend $keyringBackend " +
+                "--keyring-dir /root/.inference | jq -r '.key'",
+        ).redirectErrorStream(true).start()
+        val pubkey = proc.inputStream.bufferedReader().use { it.readText().trim() }
+        if (proc.waitFor() != 0 || pubkey.isEmpty()) {
+            error("Failed to read cold pubkey from $nodeContainer (exit=${proc.exitValue()}, out=$pubkey)")
+        }
+        return pubkey
+    }
+
+    /** Restart genesis-api if init-docker.sh exited before the shared key existed. */
+    internal fun ensureGenesisApiRunning() {
+        val apiContainer = "$pairName-api"
+        if (dockerContainerRunning(apiContainer)) {
+            return
+        }
+        if (coldAccountPubkey == null) {
+            coldAccountPubkey = extractColdPubkeyFromNodeContainer()
+        }
+        Logger.warn("API container {} not running; recreating with ACCOUNT_PUBKEY", apiContainer)
         val composeArgs = mutableListOf("compose", "-p", pairName)
         composeFiles.forEach { file ->
             composeArgs.addAll(listOf("-f", file))
         }
-        composeArgs.addAll(listOf("--project-directory", workingDirectory, "down"))
-        dockerProcess(*composeArgs.toTypedArray()).start().waitFor()
+        composeArgs.addAll(listOf("--project-directory", workingDirectory, "up", "-d", "--force-recreate", "api"))
+        val exit = runComposeLogged("genesis-api-recreate", *composeArgs.toTypedArray())
+        if (exit != 0) {
+            logComposeProjectState("after-failed-genesis-api-recreate")
+            logInferenceStackContainers(pairName, "after-failed-genesis-api-recreate")
+            logProxyStackDiagnostics(pairName, "after-failed-genesis-api-recreate")
+        }
+        val deadline = System.nanoTime() + Duration.ofMinutes(2).toNanos()
+        while (System.nanoTime() < deadline) {
+            if (dockerContainerRunning(apiContainer)) {
+                return
+            }
+            Thread.sleep(Duration.ofSeconds(2))
+        }
+        logProxyStackDiagnostics(pairName, "genesis-api-did-not-stay-running")
+        error("$apiContainer did not stay running (check: docker logs $apiContainer)")
+    }
+
+    /**
+     * Full genesis `compose up -d` with exit-code check and proxy-stack readiness.
+     * Proxy depends_on edge-api; ignoring compose exit previously left discovery without genesis-proxy.
+     *
+     * Shared test-dns is prestarted (long-lived). Retry frees .10 if something else stole it,
+     * then re-ensures CoreDNS — without tearing down a healthy test-dns.
+     */
+    private fun bringUpGenesisFullStack(baseArgs: List<String>) {
+        ensureSharedTestDns()
+        Logger.info("[{}] Starting genesis full stack (up -d)", pairName)
+        var exit = runComposeLogged(
+            "genesis-full-stack-up",
+            *(baseArgs + listOf("up", "-d")).toTypedArray(),
+        )
+        if (exit != 0) {
+            Logger.warn(
+                "[{}] genesis full stack up exited {}; ensuring DNS IP {} and retrying once",
+                pairName,
+                exit,
+                TEST_DNS_IPV4,
+            )
+            releaseAddressOnChainPublic(TEST_DNS_IPV4)
+            ensureSharedTestDns()
+            Thread.sleep(Duration.ofSeconds(1))
+            exit = runComposeLogged(
+                "genesis-full-stack-up-retry",
+                *(baseArgs + listOf("up", "-d")).toTypedArray(),
+            )
+        }
+        logComposeProjectState("after-genesis-full-stack-up")
+        logInferenceStackContainers(pairName, "after-genesis-full-stack-up")
+        if (exit != 0) {
+            logProxyStackDiagnostics(pairName, "genesis-full-stack-up-failed")
+            error(
+                "[$pairName] genesis compose up -d exited $exit. " +
+                    "Proxy/edge-api may be missing; see compose + proxy stack diagnostics in logs.",
+            )
+        }
+        waitForProxyStackReady()
+    }
+
+    /**
+     * Pair discovery requires a running `*-proxy`. On this branch proxy also needs `*-edge-api`.
+     * Retry until both are running; dump inspect/logs/nginx -t on timeout for CI.
+     */
+    internal fun waitForProxyStackReady(timeout: Duration = Duration.ofSeconds(90)) {
+        val edge = "$pairName-edge-api"
+        val proxy = "$pairName-proxy"
+        Logger.info("[{}] Waiting for proxy stack: {} and {}", pairName, edge, proxy)
+        val deadline = System.nanoTime() + timeout.toNanos()
+        val recoverAt = System.nanoTime() + Duration.ofSeconds(20).toNanos()
+        var attemptedRecover = false
+        var lastLogAt = 0L
+        while (System.nanoTime() < deadline) {
+            val edgeOk = dockerContainerRunning(edge)
+            val proxyOk = dockerContainerRunning(proxy)
+            if (edgeOk && proxyOk) {
+                Logger.info("[{}] Proxy stack ready (edge-api + proxy running)", pairName)
+                return
+            }
+            val now = System.nanoTime()
+            if (!attemptedRecover && now >= recoverAt) {
+                attemptedRecover = true
+                Logger.warn(
+                    "[{}] proxy stack still down; explicitly starting edge-api + proxy",
+                    pairName,
+                )
+                val composeArgs = mutableListOf("compose", "-p", pairName)
+                composeFiles.forEach { file ->
+                    composeArgs.addAll(listOf("-f", file))
+                }
+                composeArgs.addAll(
+                    listOf("--project-directory", workingDirectory, "up", "-d", "edge-api", "proxy"),
+                )
+                val recoverExit = runComposeLogged("proxy-stack-recover-up", *composeArgs.toTypedArray())
+                if (recoverExit != 0) {
+                    logProxyStackDiagnostics(pairName, "proxy-stack-recover-failed")
+                }
+            }
+            if (now - lastLogAt > Duration.ofSeconds(15).toNanos()) {
+                Logger.warn(
+                    "[{}] proxy stack not ready yet: edge-api.running={} proxy.running={}",
+                    pairName,
+                    edgeOk,
+                    proxyOk,
+                )
+                logInferenceStackContainers(pairName, "proxy-stack-wait")
+                lastLogAt = now
+            }
+            Thread.sleep(Duration.ofSeconds(2))
+        }
+        logComposeProjectState("proxy-stack-timeout")
+        logProxyStackDiagnostics(pairName, "proxy-stack-timeout")
+        error(
+            "[$pairName] proxy stack not ready within ${timeout.seconds}s " +
+                "(need running $edge and $proxy). See proxy stack diagnostics in logs.",
+        )
+    }
+
+    private fun dockerContainerRunning(containerName: String): Boolean = isDockerContainerRunning(containerName)
+
+    fun tearDownExisting(preservePostgres: Boolean = false) {
+        if (!preservePostgres) {
+            // Default: full project down including postgres volumes. Keeps shared
+            // test-dns (separate compose project) alive across reboots.
+            Logger.info("Fully tearing down docker group with keyName={}", pairName)
+            val composeArgs = mutableListOf("compose", "-p", pairName)
+            composeFiles.forEach { file ->
+                composeArgs.addAll(listOf("-f", file))
+            }
+            composeArgs.addAll(listOf("--project-directory", workingDirectory, "down", "-v"))
+            dockerProcess(*composeArgs.toTypedArray()).start().waitFor()
+            return
+        }
+        Logger.info(
+            "Tearing down ephemeral services for keyName={} (resetting postgres; keeping shared test-dns)",
+            pairName,
+        )
+        val composeArgs = mutableListOf("compose", "-p", pairName)
+        composeFiles.forEach { file ->
+            composeArgs.addAll(listOf("-f", file))
+        }
+        composeArgs.addAll(listOf("--project-directory", workingDirectory))
+        // Stop/rm only ephemeral services so shared test-dns stays up.
+        // Bind-mounted dapi state is cleaned separately by launch scripts.
+        //
+        // Intersect with services actually defined in THIS group's compose set:
+        // `docker compose stop <unknown-service>` aborts the whole command (exit 255)
+        // and stops nothing, leaving stale chain-node running against wiped prod-local.
+        val definedServices = composeServiceNames(composeArgs)
+        val ephemeral = PAIR_EPHEMERAL_SERVICES.filter { it in definedServices }
+        if (ephemeral.isEmpty()) {
+            Logger.warn("[{}] No ephemeral services resolved from compose set; skipping stop/rm", pairName)
+        } else {
+            val stopArgs = composeArgs + listOf("stop") + ephemeral
+            dockerProcess(*stopArgs.toTypedArray()).start().waitFor()
+            val rmArgs = composeArgs + listOf("rm", "-f") + ephemeral
+            dockerProcess(*rmArgs.toTypedArray()).start().waitFor()
+        }
+        resetPostgresServices(composeArgs, definedServices)
+    }
+
+    /** Service names defined in this group's compose set (`compose config --services`). */
+    private fun composeServiceNames(composeArgs: List<String>): Set<String> {
+        val proc = dockerProcess(*(composeArgs + listOf("config", "--services")).toTypedArray())
+            .redirectErrorStream(false)
+        val process = proc.start()
+        val services = process.inputStream.bufferedReader().readLines()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+        process.waitFor()
+        return services
+    }
+
+    /**
+     * Drop pair postgres (and shared [devshard-postgres] when present) so payload/diff
+     * tables cannot leak across reboots (duplicate-key on `devshard_diffs_*`).
+     */
+    private fun resetPostgresServices(composeArgs: List<String>, definedServices: Set<String>) {
+        val pgServices = PAIR_POSTGRES_SERVICES.filter { it in definedServices }
+        if (pgServices.isNotEmpty()) {
+            Logger.info("[{}] Resetting postgres services: {}", pairName, pgServices.joinToString(","))
+            dockerProcess(*(composeArgs + listOf("stop") + pgServices).toTypedArray()).start().waitFor()
+            // -v removes anonymous volumes attached to the containers.
+            dockerProcess(*(composeArgs + listOf("rm", "-f", "-v") + pgServices).toTypedArray()).start().waitFor()
+        }
+        // Named volume from docker-compose-base.yml (`postgres-data`) survives `rm -v`
+        // unless removed explicitly — that is what caused stale payloads across tests.
+        runDockerLogged("postgres-volume-rm-$pairName", "volume", "rm", "-f", "${pairName}_postgres-data")
+        // Shared genesis-only volume name if compose project labels differ.
+        if (pairName == "genesis") {
+            runDockerLogged("devshard-postgres-rm", "rm", "-f", "devshard-postgres")
+        }
     }
 
     var coldAccountPubkey: String? = null
 
     private fun getCommonEnvMap(useSnapshots: Boolean): Map<String, String> {
         return buildMap {
+            // Align versiond service platform with host-built devshardd (see docker-compose.versiond.yml).
+            put("DOCKER_PLATFORM", resolveDockerPlatform())
             put("KEY_NAME", coldKeyName)
+            put("VERSIOND_SIGNER_KEY_NAME", if (isGenesis) coldKeyName else warmKeyName)
+            // Per-pair keyring backend. Genesis api creates its key inside the
+            // container with `test` backend (init-docker.sh CREATE_KEY=true).
+            // Joins create with `file` backend externally via createColdKey.
+            // Setting it unconditionally lets sibling processes (devshardd)
+            // load the key with the matching backend; existing dapi behavior
+            // is preserved because the value matches what dapi already used.
+            put("KEYRING_BACKEND", if (isGenesis) "test" else "file")
             coldAccountPubkey?.let {
                 put("ACCOUNT_PUBKEY", it)
-                put("KEYRING_BACKEND", "file")
                 put("KEYRING_PASSWORD", warmKeyPassword)
                 put("CREATE_KEY", "false")
                 // KEY_NAME in our docker/compose files is used as pair-name a LOT. We will need to unwind this
@@ -243,6 +658,7 @@ data class DockerGroup(
             put("DAPI_TX_BATCHING__VALIDATION_V2_FLUSH_SIZE", "1")
             put("DAPI_TX_BATCHING__VALIDATION_V2_FLUSH_TIMEOUT_SECONDS", "1")
             put("DAPI_TX_BATCHING__POC_COMMIT_INTERVAL_SECONDS", "1")
+            put("DAPI_STATS_FILE_STORAGE_ENABLED", "true")
             put("NODE_CONFIG_PATH", "/root/node_config.json")
             put("NODE_CONFIG", nodeConfigFile)
             put("PUBLIC_URL", publicUrl)
@@ -250,6 +666,7 @@ data class DockerGroup(
             put("ML_SERVER_PORT", mlPort.toString())
             put("ADMIN_SERVER_PORT", adminPort.toString())
             put("NATS_SERVER_PORT", natsPort.toString())
+            put("NODE_MANAGER_GRPC_PORT", nodeManagerGrpcPort.toString())
             put("POC_CALLBACK_URL", pocCallbackUrl)
             put("IS_GENESIS", isGenesis.toString().lowercase())
             put("WIREMOCK_PORT", mockExternalPort.toString())
@@ -260,7 +677,9 @@ data class DockerGroup(
             put("SYNC_WITH_SNAPSHOTS", useSnapshots.toString().lowercase())
             put("SNAPSHOT_INTERVAL", "100")
             put("SNAPSHOT_KEEP_RECENT", "5")
+            put("REST_API_ACTIVE", "true")
             put("P2P_EXTERNAL_ADDRESS", p2pExternalAddress)
+            put("EDGE_API_BUILD_CONTEXT", ".")
 
             genesisGroup?.let {
                 if (useSnapshots) {
@@ -272,6 +691,18 @@ data class DockerGroup(
                 put("SEED_NODE_P2P_URL", it.p2pUrl)
                 put("SEED_API_URL", it.apiUrl)
             }
+
+            // Each pair has its own postgres (see docker-compose-base.yml).
+            put("PGHOST", "$pairName-postgres")
+            put("PGPORT", "5432")
+            put("PGDATABASE", "payloads")
+            put("PGUSER", "payloads")
+            put("PGPASSWORD", "test")
+
+            // Test-supplied extras applied last so they override defaults.
+            // DevshardVersiond*Tests use this to set VERSIOND_BINARY_NAME,
+            // VERSIOND_FORCE, VERSIOND_OVERRIDE_<version>, VERSIOND_SERVICE_NAME (override tests).
+            putAll(config.additionalEnvVars)
         }
     }
 
@@ -294,7 +725,7 @@ data class DockerGroup(
                 
                 val exitCode = cleanupProcess.waitFor()
                 if (exitCode != 0) {
-                    val errorOutput = cleanupProcess.errorStream.bufferedReader().readText()
+                    val errorOutput = cleanupProcess.errorStream.bufferedReader().use { it.readText() }
                     Logger.warn("Docker cleanup failed with exit code {}: {}", exitCode, errorOutput)
                     // Fallback to regular deletion
                     prodLocal.deleteRecursively()
@@ -380,6 +811,7 @@ fun createDockerGroup(
         mlPort = 9001 + iteration,
         adminPort = 9002 + iteration,
         natsPort = 9004 + iteration,
+        nodeManagerGrpcPort = 9400 + iteration,
         nodeConfigFile = nodeConfigFile,
         isGenesis = iteration == 0,
         mockExternalPort = 8090 + iteration,
@@ -394,12 +826,228 @@ fun createDockerGroup(
     )
 }
 
+private fun isDockerContainerRunning(containerName: String): Boolean {
+    val proc = ProcessBuilder("docker", "inspect", "-f", "{{.State.Running}}", containerName)
+        .redirectErrorStream(true)
+        .start()
+    val out = proc.inputStream.bufferedReader().use { it.readText().trim() }
+    proc.waitFor()
+    return proc.exitValue() == 0 && out == "true"
+}
+
+private fun pairRpcSynced(pair: LocalInferencePair, minHeight: Long = 1): Boolean =
+    runCatching {
+        val status = pair.node.getStatus()
+        status.syncInfo.latestBlockHeight >= minHeight && !status.syncInfo.catchingUp
+    }.getOrDefault(false)
+
+private fun pairApiResponding(pair: LocalInferencePair): Boolean {
+    val apiContainer = "${pair.name.trimStart('/')}-api"
+    if (!isDockerContainerRunning(apiContainer)) {
+        return false
+    }
+    return runCatching {
+        pair.getParams()
+        true
+    }.getOrDefault(false)
+}
+
+private fun waitForClusterReadyBeforeInitialize(
+    cluster: LocalCluster,
+    timeout: Duration = Duration.ofSeconds(90),
+) {
+    Logger.info("Waiting for cluster readiness (RPC synced, APIs up)", "")
+    val deadline = System.nanoTime() + timeout.toNanos()
+    while (System.nanoTime() < deadline) {
+        if (!pairRpcSynced(cluster.genesis) || !pairApiResponding(cluster.genesis)) {
+            Thread.sleep(1000)
+            continue
+        }
+        val genesisHeight = runCatching { cluster.genesis.getCurrentBlockHeight() }.getOrNull()
+        val joinsReady = cluster.joinPairs.all { join ->
+            pairRpcSynced(join) &&
+                pairApiResponding(join) &&
+                (genesisHeight == null || runCatching {
+                    kotlin.math.abs(join.getCurrentBlockHeight() - genesisHeight) <= 2
+                }.getOrDefault(false))
+        }
+        if (joinsReady) {
+            Logger.info(
+                "Cluster ready for initialize (genesis block {}, {} join(s))",
+                genesisHeight,
+                cluster.joinPairs.size,
+            )
+            return
+        }
+        Thread.sleep(1000)
+    }
+    error("Cluster not ready for initialize within ${timeout.seconds} seconds")
+}
+
 fun getRepoRoot(): String {
-    val currentDir = Path.of("").toAbsolutePath()
+    // Allow an explicit override so worktrees / additional checkouts (e.g.
+    // gonka-2) can run tests without renaming their directory.
+    System.getenv("GONKA_REPO_ROOT")?.takeIf { it.isNotBlank() }?.let { return it }
+
+    val currentDir = Path.of("").toAbsolutePath().normalize()
     return generateSequence(currentDir) { it.parent }
-        .firstOrNull { it.fileName.toString() == "gonka" }
+        .firstOrNull { candidate ->
+            Files.isDirectory(candidate.resolve("testermint")) &&
+                Files.isDirectory(candidate.resolve("local-test-net")) &&
+                Files.isDirectory(candidate.resolve("versioned"))
+        }
         ?.toString()
-        ?: throw IllegalStateException("Repository root 'gonka' not found")
+        ?: throw IllegalStateException("Repository root not found from $currentDir (set GONKA_REPO_ROOT to override)")
+}
+
+/**
+ * Force-remove shared CoreDNS and free its fixed IP on chain-public.
+ * Used by full stop paths; normal test reboot keeps test-dns via [ensureSharedTestDns].
+ *
+ * `docker rm -f test-dns` alone is not enough: Docker can leave 172.25.0.10
+ * allocated on the bridge after multi-project reboot tearDowns, so the next
+ * `test-dns` start fails with "Address already in use".
+ */
+fun removeSharedTestDns() {
+    Logger.info("Removing shared test-dns container if present", "")
+    val repoRoot = getRepoRoot()
+    runDockerLogged(
+        "testdns-compose-down",
+        "compose",
+        "-p", SHARED_DNS_PROJECT,
+        "-f", "$repoRoot/$DNS_SERVER_COMPOSE_FILE",
+        "--project-directory", repoRoot,
+        "down", "-v",
+    )
+    runDockerLogged("test-dns-rm", "rm", "-f", "test-dns")
+    // Clear a stale network endpoint even when the container is already gone.
+    runDockerLogged(
+        "test-dns-disconnect",
+        "network", "disconnect", "-f", "chain-public", "test-dns",
+    )
+    releaseAddressOnChainPublic(TEST_DNS_IPV4)
+}
+
+/**
+ * Create chain-public with IPAM that keeps 172.25.0.10 outside the DHCP pool.
+ * Pair compose files mark the network external so they do not reject a
+ * non-compose-created network (missing com.docker.compose.network labels).
+ *
+ * Do not use --aux-address for .10: Docker then rejects CoreDNS static assign.
+ */
+fun ensureChainPublicNetwork() {
+    val inspect = runDockerLogged("chain-public-inspect-exists", "network", "inspect", "chain-public")
+    if (inspect == 0) {
+        return
+    }
+    Logger.info("Creating chain-public with DHCP pool excluding reserved DNS IP {}", TEST_DNS_IPV4)
+    val createExit = runDockerLogged(
+        "chain-public-create",
+        "network", "create",
+        "--driver", "bridge",
+        "--subnet", "172.25.0.0/16",
+        "--gateway", "172.25.0.1",
+        "--ip-range", "172.25.128.0/17",
+        "chain-public",
+    )
+    if (createExit != 0) {
+        error("Failed to create chain-public network (exit $createExit)")
+    }
+}
+
+/**
+ * Ensure long-lived CoreDNS is running on 172.25.0.10 (compose project [SHARED_DNS_PROJECT]).
+ * No-op if already healthy; does not restart a running container.
+ */
+fun ensureSharedTestDns() {
+    ensureChainPublicNetwork()
+    if (isDockerContainerRunning("test-dns")) {
+        Logger.info("Shared test-dns already running; leaving it up", "")
+        return
+    }
+    // Free .10 if a stale endpoint holds it before starting CoreDNS.
+    releaseAddressOnChainPublic(TEST_DNS_IPV4)
+    Logger.info("Starting shared test-dns (project={})", SHARED_DNS_PROJECT)
+    val repoRoot = getRepoRoot()
+    val exit = runDockerLogged(
+        "testdns-up",
+        "compose",
+        "-p", SHARED_DNS_PROJECT,
+        "-f", "$repoRoot/$DNS_SERVER_COMPOSE_FILE",
+        "--project-directory", repoRoot,
+        "up", "-d",
+    )
+    if (exit != 0) {
+        error("Failed to start shared test-dns (exit $exit)")
+    }
+    val deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos()
+    while (System.nanoTime() < deadline) {
+        if (isDockerContainerRunning("test-dns")) {
+            return
+        }
+        Thread.sleep(Duration.ofSeconds(1))
+    }
+    error("test-dns did not become running after compose up")
+}
+
+/** Force-disconnect any chain-public endpoint still holding [ipv4]. */
+private fun releaseAddressOnChainPublic(ipv4: String) {
+    val process = ProcessBuilder(
+        "docker", "network", "inspect", "chain-public",
+        "--format", "{{range .Containers}}{{.Name}} {{.IPv4Address}}\n{{end}}",
+    ).redirectErrorStream(true).start()
+    val lines = process.inputStream.bufferedReader().readLines()
+    process.waitFor()
+    lines.forEach { line ->
+        Logger.info("chain-public-endpoint> {}", line)
+        val parts = line.trim().split(Regex("\\s+"))
+        if (parts.size >= 2 && (parts[1].startsWith("$ipv4/") || parts[1] == ipv4)) {
+            val name = parts[0]
+            if (name == "test-dns" && isDockerContainerRunning("test-dns")) {
+                // Keep a healthy CoreDNS endpoint.
+                return@forEach
+            }
+            Logger.warn("Force-disconnecting {} from chain-public (holds {})", name, ipv4)
+            runDockerLogged(
+                "ip-release-disconnect",
+                "network", "disconnect", "-f", "chain-public", name,
+            )
+        }
+    }
+}
+
+/**
+ * After all pair tearDowns, drop chain-public so IPAM is reset — only when test-dns
+ * is not holding the network (normal reboot keeps DNS and skips this).
+ */
+fun recreateChainPublicNetworkIfPossible() {
+    if (isDockerContainerRunning("test-dns")) {
+        Logger.info("Skipping chain-public rm; shared test-dns still attached", "")
+        return
+    }
+    Logger.info("Attempting to remove chain-public network to reset DNS IPAM", "")
+    val exit = runDockerLogged("chain-public-rm", "network", "rm", "chain-public")
+    if (exit != 0) {
+        Logger.warn(
+            "Could not remove chain-public (still in use?). Listing endpoints:",
+            "",
+        )
+        runDockerLogged(
+            "chain-public-inspect",
+            "network", "inspect", "chain-public",
+            "--format", "{{range .Containers}}{{.Name}} {{.IPv4Address}}\n{{end}}",
+        )
+    }
+}
+
+private fun runDockerLogged(context: String, vararg args: String): Int {
+    val process = ProcessBuilder("docker", *args)
+        .redirectErrorStream(true)
+        .start()
+    process.inputStream.bufferedReader().lines().forEach { line ->
+        Logger.info("{}> {}", context, line)
+    }
+    return process.waitFor()
 }
 
 fun initializeCluster(joinCount: Int = 0, config: ApplicationConfig, currentCluster: LocalCluster?): List<DockerGroup> {
@@ -417,7 +1065,7 @@ fun initializeCluster(joinCount: Int = 0, config: ApplicationConfig, currentClus
                     config,
                     false
                 )
-            }.forEach { it.tearDownExisting() }
+            }.forEach { it.tearDownExisting(preservePostgres = false) }
         }
         val joinGroups = (1..joinCount).mapIndexed { index, _ ->
             val actualIndex = (index + 1) * 10
@@ -426,10 +1074,70 @@ fun initializeCluster(joinCount: Int = 0, config: ApplicationConfig, currentClus
         val allGroups = listOf(genesisGroup) + joinGroups
         Logger.info("Initializing cluster with {} nodes", allGroups.size)
         allGroups.forEach { it.tearDownExisting() }
+        // Keep shared CoreDNS across reboots. Only recreate chain-public IPAM when
+        // DNS is not attached (e.g. first run after stop.sh).
+        if (!isDockerContainerRunning("test-dns")) {
+            recreateChainPublicNetworkIfPossible()
+        }
+        ensureSharedTestDns()
         genesisGroup.init()
-        // TODO: can we wait here by querying the genesis API?
         Thread.sleep(Duration.ofSeconds(30L))
-        joinGroups.forEach { it.init() }
+        val genesisNode = retryGetCli(config, genesisGroup.pairName)
+        Logger.info("Waiting for genesis RPC readiness", "")
+        val readinessDeadline = System.nanoTime() + Duration.ofSeconds(90).toNanos()
+        while (true) {
+            try {
+                if (genesisNode.getStatus().syncInfo.latestBlockHeight >= 1) {
+                    break
+                }
+            } catch (e: Exception) {
+                Logger.debug("Genesis RPC not ready yet: ${e.message}", "")
+            }
+            if (System.nanoTime() >= readinessDeadline) {
+                error("Genesis RPC did not become ready within 90 seconds")
+            }
+            Thread.sleep(1000)
+        }
+        if (genesisGroup.usesVersiondOverlay()) {
+            genesisGroup.ensureGenesisApiRunning()
+        }
+        // Discovery requires a running genesis-proxy (and edge-api on this branch).
+        // Wait + dump diagnostics here so CI logs show why pair discovery would fail.
+        Logger.info("Waiting for genesis proxy stack before pair discovery", "")
+        genesisGroup.waitForProxyStackReady()
+        val genesisPairs = getLocalInferencePairs(config)
+        val genesisPair = genesisPairs
+            .firstOrNull { it.name == genesisGroup.pairName || it.name == "/${genesisGroup.pairName}" }
+        if (genesisPair == null) {
+            Logger.error(
+                "Genesis pair missing after proxy-stack wait. discovered={}",
+                genesisPairs.map { it.name },
+            )
+            logProxyStackDiagnostics(genesisGroup.pairName, "genesis-pair-not-found")
+            logInferenceStackContainers(genesisGroup.pairName, "genesis-pair-not-found")
+            error(
+                "Could not find local inference pair for keyName=${genesisGroup.pairName}. " +
+                    "Proxy stack diagnostics were logged; check genesis-proxy / genesis-edge-api.",
+            )
+        }
+        Logger.info("Waiting for genesis API and ML nodes readiness", "")
+        genesisPair.waitForMlNodesToLoad(maxWaitAttempts = 18)
+        if (joinGroups.isNotEmpty()) {
+            val failures = java.util.Collections.synchronizedList(mutableListOf<Throwable>())
+            joinGroups.map { group ->
+                Thread {
+                    try {
+                        group.init()
+                    } catch (e: Throwable) {
+                        failures.add(e)
+                    }
+                }.apply {
+                    name = "join-init-${group.pairName}"
+                    start()
+                }
+            }.forEach { it.join() }
+            failures.firstOrNull()?.let { throw it }
+        }
         return allGroups
     } finally {
         TestState.rebooting = false
@@ -450,7 +1158,7 @@ fun initCluster(
     val rebootFlagOn = Files.deleteIfExists(Path.of("reboot.txt"))
     val cluster = try {
         val c = setupLocalCluster(joinCount, finalConfig, reboot || rebootFlagOn)
-        Thread.sleep(50000)
+        waitForClusterReadyBeforeInitialize(c)
         logSection("Found cluster, initializing")
         initialize(c.allPairs, resetMlNodes = resetMlNodes)
         c
@@ -511,7 +1219,7 @@ fun getLocalCluster(config: ApplicationConfig): LocalCluster? {
         Logger.error("Expected exactly one genesis pair, found ${genesis.size}", "")
     }
     return genesis.singleOrNull()?.let {
-        LocalCluster(it, join)
+        LocalCluster(it, join.sortedBy { it.name })
     }
 }
 
@@ -520,6 +1228,7 @@ data class LocalCluster(
     val joinPairs: List<LocalInferencePair>,
 ) {
     val allPairs = listOf(genesis) + joinPairs
+
     fun withAdditionalJoin(joinCount: Int = 1): LocalCluster {
         val currentMaxJoin = this.joinPairs.size
         val newMaxJoin = currentMaxJoin + joinCount
@@ -530,7 +1239,7 @@ data class LocalCluster(
                     iteration = it * 10,
                     genesisUrls = GenesisUrls(this.genesis.name.trimStart('/')),
                     config = this.genesis.config,
-                    useSnapshots = true
+                    useSnapshots = true,
                 )
             }
         newJoinGroups.forEach { it.tearDownExisting() }
@@ -539,7 +1248,7 @@ data class LocalCluster(
     }
 
     fun withConsumer(name: String, action: (Consumer) -> Unit) {
-        val consumer = create(this, name)
+        val consumer = Consumer.create(this, name)
         try {
             action(consumer)
         } finally {
@@ -550,14 +1259,12 @@ data class LocalCluster(
     fun waitForMlNodesToLoad() {
         Logger.info("Waiting for ML nodes to load", "")
         allPairs.forEach { pair -> pair.waitForMlNodesToLoad() }
-        error("Timeout waiting for ML nodes to load")
     }
 }
 
 class Consumer(val name: String, val pair: LocalInferencePair, val address: String) {
     companion object {
         fun create(localCluster: LocalCluster, name: String): Consumer {
-            // TODO: Add Kube creation
             val newConfig = localCluster.genesis.config.copy(execName = localCluster.genesis.config.appName)
             val dockerExec = DockerExecutor(
                 name,
@@ -567,10 +1274,9 @@ class Consumer(val name: String, val pair: LocalInferencePair, val address: Stri
                 newConfig,
                 LogOutput(name, "consumer"),
                 dockerExec,
-                listOf()
+                listOf(),
             )
             cli.createContainer(doNotStartChain = true)
-            // PRTODO: This needs to use the file? Or override the test
             val newKey = cli.createKey(name)
             localCluster.genesis.api.addUnfundedInferenceParticipant(
                 UnfundedInferenceParticipant(
@@ -578,10 +1284,9 @@ class Consumer(val name: String, val pair: LocalInferencePair, val address: Stri
                     listOf(),
                     "",
                     newKey.pubkey.key,
-                    newKey.address
-                )
+                    newKey.address,
+                ),
             )
-            // Need time to make sure consumer is added
             localCluster.genesis.node.waitForNextBlock(2)
             return Consumer(
                 name = name,

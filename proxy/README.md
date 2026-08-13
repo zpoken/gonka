@@ -11,6 +11,8 @@ The nginx proxy routes requests to different backend services based on URL paths
 - `/chain-rpc/` → Blockchain RPC endpoint (port 26657)
 - `/chain-api/` → Blockchain REST API (port 1317)
 - `/chain-grpc/` → Blockchain gRPC endpoint (port 9090)
+- `/jaeger/` → Jaeger UI when `JAEGER_ENABLED=true` and the observability overlay is running (nginx basic auth required)
+- `/grafana/` → Grafana UI when `GRAFANA_ENABLED=true` and the observability overlay is running (Grafana login required)
 - `/health` → Nginx health check endpoint
 - `/` → Explorer dashboard when `DASHBOARD_PORT` is set, otherwise a simple "dashboard not configured" page
 
@@ -55,12 +57,28 @@ Key runtime environment variables:
 | `API_SERVICE_NAME` | api | Service name for API upstream |
 | `NODE_SERVICE_NAME` | node | Service name for chain node upstreams |
 | `EXPLORER_SERVICE_NAME` | explorer | Service name for explorer upstream |
+| `JAEGER_ENABLED` | false | Enables proxy routing for the Jaeger UI under `/jaeger/`. Requires `JAEGER_BASIC_AUTH_USER` and `JAEGER_BASIC_AUTH_PASSWORD`. |
+| `JAEGER_SERVICE_NAME` | jaeger | Service name for Jaeger UI upstream |
+| `JAEGER_PORT` | 16686 | Jaeger UI upstream port |
+| `JAEGER_BASE_PATH` | /jaeger | Base path used by proxied Jaeger UI |
+| `JAEGER_BASIC_AUTH_USER` | - | HTTP basic auth username for `/jaeger/`. Required when `JAEGER_ENABLED=true`. |
+| `JAEGER_BASIC_AUTH_PASSWORD` | - | HTTP basic auth password for `/jaeger/`. Required when `JAEGER_ENABLED=true`. Jaeger has no built-in login; nginx enforces this gate. |
+| `GRAFANA_ENABLED` | false | Enables proxy routing for Grafana under `/grafana/`. Requires a non-default `GRAFANA_ADMIN_PASSWORD`. |
+| `GRAFANA_SERVICE_NAME` | grafana | Service name for Grafana upstream |
+| `GRAFANA_PORT` | 3000 | Grafana upstream port |
+| `GRAFANA_BASE_PATH` | /grafana | Base path used by proxied Grafana UI |
+| `GRAFANA_ADMIN_PASSWORD` | - | Passed to the proxy startup check when `GRAFANA_ENABLED=true`. Must be set to a strong value before enabling public Grafana UI. Also configure on the `grafana` service. |
 | `KEY_NAME` | - | Optional stack key; when set, service names are prefixed as `<KEY_NAME>-*` |
 | `RESOLVER` | 127.0.0.11 | DNS resolver for dynamic upstream resolution (override if needed) |
+| `PROXY_REAL_IP_FROM` | - | Space-separated trusted proxy CIDRs/IPs for nginx `set_real_ip_from` (for example `172.18.0.1/32`). Empty by default (real IP parsing disabled). |
+| `PROXY_REAL_IP_HEADER` | `X-Forwarded-For` | Header used by nginx `real_ip_header` when trusted proxies are configured. |
+| `PROXY_REAL_IP_RECURSIVE` | off | Value for nginx `real_ip_recursive`. Keep `off` unless you explicitly trust a multi-hop proxy chain. |
 | `DISABLE_GONKA_API` | false | Set to `true` to disable `/api/v1/` and `/v1/` routes |
 | `DISABLE_CHAIN_RPC` | false | Set to `true` to disable `/chain-rpc/` routes |
 | `DISABLE_CHAIN_API` | false | Set to `true` to disable `/chain-api/` routes |
 | `DISABLE_CHAIN_GRPC` | false | Set to `true` to disable `/chain-grpc/` routes |
+| `DISABLE_VALIDATOR_WHITELIST` | true | Unset or `true` keeps participant IP whitelist sync off (all clients use per-IP rate limits only). Set to `false` to sync participant inference IPs into nginx (separate rate-limit key and log tag `INT` vs `EXT`). |
+| `DISABLE_FAIL2BAN` | true | Unset or `true` disables automatic IP banning from access logs. Set to `false` to enable scoring (401/403/400 by default) and temporary nginx bans via `geo $is_banned`. Validator IPs are exempt from bans when validator whitelist sync is enabled (`DISABLE_VALIDATOR_WHITELIST=false`). |
 | `CORS_ALLOW_ORIGIN` | * | Allowed Origin for CORS headers. Defaults to wildcard `*`. |
 | `GLOBAL_RATE_LIMIT_RPS` | 1000 | Global "safety net" rate limit (default: 1000). |
 | `GLOBAL_RATE_UNIT` | s | Unit for global limit (`s` or `m`). |
@@ -88,8 +106,180 @@ Key runtime environment variables:
 | `CHAIN_GRPC_RATE_LIMIT_RPS` | 20 | Rate limit for `/chain-grpc/` (default: 20). |
 | `CHAIN_GRPC_RATE_UNIT` | m | Unit for chain gRPC (`s` or `m`). Default `m`. |
 | `CHAIN_GRPC_BURST` | 200 | Burst for chain gRPC. |
+| `EDGE_API_SERVICE_NAME` | (empty) | Upstream for read-only `/v1/` query routes (status, models, epochs, participants, BLS, bridge addresses, etc.) served by **edge-api**. Empty (default) sends all `/v1/` traffic to dapi. Set to `edge-api` to enable, or `edge-api-router` when using the multi-instance overlay. |
+| `EDGE_API_PORT` | 18080 | Port on the edge-api (or edge-api-router) upstream. |
+| `EDGE_API_ROUTE_PATHS` | (18 public paths) | Space-separated public Tier A `/v1/` paths steered to edge-api before the catch-all `/v1/` → dapi block. Defaults: `EDGE_API_ROUTE_PATHS_DEFAULT` in `proxy/entrypoint.sh`. |
+| `EDGE_API_OPTIONAL_ROUTE_PATHS` | verify/debug (4) | CPU-heavy helpers (`/v1/verify-proof`, `/v1/verify-block`, `/v1/debug/...`). **Not published by default.** |
+| `EDGE_API_EXPOSE_OPTIONAL_ROUTES` | false | Set `true` to publish optional verify/debug routes to edge-api. Keep `false` and put auth (basic/mTLS/IP allowlist) on nginx if you expose them. When private, proxy returns **403** for those paths. |
+| `VERSIOND_SERVICE_NAME` | versiond | Upstream for `/devshard/` (and legacy `/v1/devshard/` after rewrite). Set to `versiond-router` for sticky multi-versiond overlay. |
+| `VERSIOND_PORT` | 8080 | Port on the versiond (or versiond-router) upstream. |
+| `DISABLE_DEVSHARD_PROXY` | false | Set to `true` to disable `/devshard/` and `/v1/devshard/` routing to versiond. |
+| `DEVSHARD_OBS_RATE_LIMIT_RPS` | 10 | Per-IP rate limit for public observability GETs (`/devshard/sessions|stats|metrics|healthz` and rewritten legacy obs URLs). Protocol chat/gossip/payloads stay on the exempt zone. |
+| `DEVSHARD_OBS_RATE_UNIT` | s | Unit for obs rate (`s` or `m`). |
+| `DEVSHARD_OBS_BURST` | 20 | Burst for obs rate limit. |
+
+Versiond-side (on the versiond container, not the join proxy):
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `PGHOST` / `DATABASE_URL` | unset | When set, versiond looks up `sessions.version` for versionless session obs. |
+| `VERSIOND_DISABLE_SESSION_LOOKUP` | false | Force fan-out even if Postgres is configured. |
+
+### Devshard observability routing
+
+Public observability paths that still include a version segment are **rewritten
+internally** to versionless canonical URIs (no client-visible redirect). Clients
+keep calling the old URLs; nginx drops the version segment before versiond so
+scrapers need not follow redirects and cannot bind protocol version via the path.
+
+**Prefer these URLs in new monitors / runbooks:**
+
+```text
+GET /devshard/sessions/{escrow_id}/diffs
+GET /devshard/sessions/{escrow_id}/mempool
+GET /devshard/sessions/{escrow_id}/signatures
+GET /devshard/stats/shards
+GET /devshard/stats/shards/{escrow_id}
+GET /devshard/metrics
+GET /devshard/healthz                 # versiond supervisor (not a child)
+GET /devshard/{version}/healthz       # that child's healthz
+```
+
+| Client URL (legacy, still works) | Internal route to versiond |
+|----------------------------------|----------------------------|
+| `GET /devshard/{version}/sessions/{id}/diffs` | `/devshard/sessions/{id}/diffs` |
+| `GET /devshard/{version}/sessions/{id}/mempool` | `/devshard/sessions/{id}/mempool` |
+| `GET /devshard/{version}/sessions/{id}/signatures` | `/devshard/sessions/{id}/signatures` |
+| `GET /devshard/{version}/stats/shards…` | `/devshard/stats/shards…` |
+| `GET /devshard/{version}/metrics` | `/devshard/metrics` |
+| `GET /devshard/{version}/healthz` | **not rewritten** — proxied as `/{version}/healthz` to that child |
+
+Protocol traffic stays versioned: `POST …/chat/completions`, gossip, challenge-receipt, and `GET …/payloads` are **not** rewritten.
+
+Public obs paths (versionless and rewritten legacy) use a dedicated nginx zone (`devshard_obs`, default `10r/s` burst `20`) so scrapers cannot amplify polling under the exempt chat limits. Chat / gossip / payloads remain on the exempt catch-all.
+
+versiond serves the versionless obs paths:
+
+- **Session-scoped** (`/sessions/{id}/diffs|mempool|signatures`, `/stats/shards/{id}`): when Postgres is configured (`PGHOST` / `DATABASE_URL`), route by `sessions.version`; unbound → 404. If lookup is disabled or PG errors, fan-out across children. Lookup errors emit a rate-limited warn (`session version lookup failed; falling back to fan-out`) and increment an in-process counter (`proxy.LookupFanoutErrors`) — they are not silent.
+- **Process-level** (`/metrics`, `/stats/shards` list): pin to newest running version by numeric/dotted comparison (`v10` > `v2`, `v0.2.11` > `v0.2.9`), not lexicographic order.
+- **Health:** `GET /healthz` on versiond is **supervisor** status (mux, ahead of the proxy). Join proxy `GET /devshard/healthz` hits that. Per-child health is `GET /devshard/{version}/healthz` (not rewritten). Do not use versionless `/healthz` to probe a specific child.
+
+Disable lookup: `VERSIOND_DISABLE_SESSION_LOOKUP=true`.
+
+Grafana dashboards in `deploy/join/observability/` scrape Prometheus metrics from
+devshardd `/metrics` via service discovery — they do not call HTTP diffs URLs.
+For ad-hoc HTTP debugging of a shard, use the versionless paths above.
+
+When `VERSIOND_SERVICE_NAME=versiond-router`, this proxy still has a **single**
+upstream. Multi-host stickiness and **legacy SQLite pinning** are configured on
+**versiond-router** itself:
+
+| Router env | Role |
+| --- | --- |
+| `VERSIOND_HOSTS` | HA pool (space-separated) |
+| `VERSIOND_LEGACY_HOST` | Host that owns pre-HA SQLite data dirs (default: first of `VERSIOND_HOSTS`) |
+| `VERSIOND_NON_HA_VERSIONS` | Version path segments pinned to legacy (whitespace and/or comma). Empty = all versions HA. Future versions are HA by default |
+
+Multi-host HA requests get `Devshard-Ha: true`; `devshardd` requires
+`DEVSHARD_STORAGE_MODE=postgres` + `PGHOST`. See `versiond-router/` and
+`devshard/docs/pr-1366-deploy-test-plan.md`.
+
+### edge-api vs dapi routing
+
+`/v1/` is split across two backends. The proxy registers **exact/regex locations for read-only query paths** before the generic `/v1/` catch-all:
+
+- **edge-api (public Tier A)** — status, models, pricing, participants (GET), epochs, restrictions, BLS, bridge addresses, poc-batches
+- **edge-api (optional)** — `verify-proof` / `verify-block` / `debug/*`; private by default (`EDGE_API_EXPOSE_OPTIONAL_ROUTES=false` → 403). Opt in when needed; auth can be enforced in nginx before this proxy.
+- **dapi (`api`)** — inference and node operations: chat/completions, inference payloads, PoC proofs, stats, bridge queue, participant registration (`POST /v1/participants`)
+- **versiond** — devshard sessions: `/v1/devshard/*` is rewritten internally to `/devshard/v1/*`, then proxied like other `/devshard/` traffic
+
+`/v1/participants` is method-split: GET/HEAD/OPTIONS → edge-api; other methods (notably POST registration) → dapi via an internal named location. Without that split, nginx would send POST to edge-api and return 405.
+
+To publish verify/debug on the public proxy:
+
+```bash
+export EDGE_API_EXPOSE_OPTIONAL_ROUTES=true
+# Optional: front with nginx basic auth / allowlist before this container.
+```
+
+Multi-instance edge-api (local-test-net or `deploy/join/docker-compose.edge-api-multi.yml`):
+
+```text
+Client → proxy → edge-api-router:18080 → edge-api-N:18080
+```
+
+This mirrors the `versiond-router` pattern but uses round-robin (read-only queries are stateless).
+
+### Observability UI security
+
+Jaeger and Grafana UIs are **disabled by default** (`JAEGER_ENABLED=false`, `GRAFANA_ENABLED=false` in `deploy/join/config.env.template`). The observability stack (Prometheus, Loki, trace export) can run without exposing UIs on the public proxy.
+
+When enabling public UI routes, set credentials **before** flipping the enable flags:
+
+1. **Jaeger** — Jaeger has no application login. Set `JAEGER_BASIC_AUTH_USER` and `JAEGER_BASIC_AUTH_PASSWORD`, then set `JAEGER_ENABLED=true`. The proxy refuses to start if Jaeger is enabled without basic auth credentials.
+2. **Grafana** — Set a strong `GRAFANA_ADMIN_PASSWORD` (and optionally `GRAFANA_ADMIN_USER`), then set `GRAFANA_ENABLED=true`. The proxy refuses to start if Grafana is enabled with a missing or placeholder password (`admin1`, `<FILLIN>`, etc.).
+
+Example (`deploy/join/config.env`):
+
+```bash
+export JAEGER_BASIC_AUTH_USER=jaeger
+export JAEGER_BASIC_AUTH_PASSWORD='your-jaeger-basic-auth-secret'
+export GRAFANA_ADMIN_USER=admin
+export GRAFANA_ADMIN_PASSWORD='your-grafana-admin-secret'
+export JAEGER_ENABLED=true
+export GRAFANA_ENABLED=true
+```
+
+See `docs/observability/observability-overview.md` for the full join-stack setup.
 
 > **Note**: `GLOBAL_RATE_LIMIT_RPS` acts as a total ceiling for a single IP. It must be higher than your highest specific limit (e.g. higher than Exempt limit).
+
+### Trusted Proxy / Real IP
+
+- `PROXY_REAL_IP_FROM` should include only the immediate proxy/LB hop(s) that connect to nginx.
+- Prefer exact addresses or narrow CIDRs (`/32`) over broad private ranges.
+- If your proxy is directly internet-facing (no upstream LB/reverse-proxy), leave `PROXY_REAL_IP_FROM` unset.
+
+Example (Docker bridge gateway):
+
+```
+PROXY_REAL_IP_FROM=172.18.0.1/32
+PROXY_REAL_IP_HEADER=X-Forwarded-For
+PROXY_REAL_IP_RECURSIVE=off
+```
+
+#### Recommended Setup By Scenario
+
+Direct Docker proxy on a server (no ingress/LB in front):
+
+```
+# Best: disable real_ip parsing (nginx already sees client IP)
+PROXY_REAL_IP_FROM=
+PROXY_REAL_IP_HEADER=X-Forwarded-For
+PROXY_REAL_IP_RECURSIVE=off
+```
+
+Docker proxy behind one trusted ingress/LB hop:
+
+```
+# Trust only the ingress/LB source IP(s)
+PROXY_REAL_IP_FROM=172.18.0.1/32
+PROXY_REAL_IP_HEADER=X-Forwarded-For
+PROXY_REAL_IP_RECURSIVE=off
+```
+
+Docker proxy behind multiple trusted proxy layers:
+
+```
+# Only if every proxy in chain is trusted and controlled by you
+PROXY_REAL_IP_FROM=10.42.16.0/20 10.42.32.0/20
+PROXY_REAL_IP_HEADER=X-Forwarded-For
+PROXY_REAL_IP_RECURSIVE=on
+```
+
+Avoid:
+- Broad defaults like `10.0.0.0/8 172.16.0.0/12 192.168.0.0/16`.
+- Enabling `PROXY_REAL_IP_RECURSIVE=on` unless you intentionally trust a full proxy chain.
 
 ### Modes
 
@@ -109,7 +299,6 @@ Below are minimal environment configurations for the compose stack under `deploy
 NGINX_MODE=http
 API_PORT=8000
 ```
-
 #### HTTPS only via proxy-ssl (443 → 8443)
 
 ```
@@ -214,6 +403,20 @@ mkdir -p secrets/nginx-ssl secrets/certbot
 ```
 source ./config.env && \
 docker compose --profile "ssl" -f docker-compose.yml -f docker-compose.mlnode.yml up -d
+```
+
+- Initial start with observability overlay:
+
+```
+source ./config.env && \
+docker compose -f docker-compose.yml -f docker-compose.mlnode.yml -f docker-compose.observability.yml up -d
+```
+
+- Access the observability UIs through the proxy after startup:
+
+```
+${PUBLIC_URL}/jaeger/
+${PUBLIC_URL}/grafana/
 ```
 
 - Update currently running node:

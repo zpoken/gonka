@@ -3,6 +3,7 @@ import com.productscience.inferenceRequest
 import com.productscience.initCluster
 import com.productscience.logSection
 import org.assertj.core.api.Assertions.assertThat
+import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.tinylog.kotlin.Logger
 import java.time.Duration
@@ -10,9 +11,10 @@ import kotlin.test.assertNotNull
 
 class PruningTests : TestermintTest() {
     @Test
+    @Tag("exclude") // Classic inference flow removed (PR #1386)
     fun `prune inferences`() {
         val (_, genesis) = initCluster(reboot = true)
-        genesis.waitForNextInferenceWindow()
+        genesis.waitForStage(EpochStage.SET_NEW_VALIDATORS, offset = 2)
         logSection("Making Inference")
         val inferenceResult = genesis.makeInferenceRequest(inferenceRequest)
         genesis.node.waitForNextBlock(2)
@@ -34,10 +36,11 @@ class PruningTests : TestermintTest() {
         
         // Check if PoC v2 is enabled - v1 batch queries won't return data when v2 is active
         val params = genesis.getParams()
-        val isPocV2Enabled = !params.pocParams.modelId.isNullOrEmpty()
+        val primaryPoCModel = params.pocParams.primaryModelConfig()
+        val isPocV2Enabled = !primaryPoCModel?.modelId.isNullOrEmpty()
         if (isPocV2Enabled) {
             logSection("PoC v2 is enabled - skipping v1-specific pruning test (v2 uses different storage)")
-            Logger.info("PoC v2 enabled with modelId=${params.pocParams.modelId}, seqLen=${params.pocParams.seqLen}")
+            Logger.info("PoC v2 enabled with modelId=${primaryPoCModel?.modelId}, seqLen=${primaryPoCModel?.seqLen}")
             // With v2 enabled, v1 batch/validation counts should always be 0 since no v1 batches are submitted
             // V2 pruning would need dedicated v2 count queries which aren't implemented yet
             return

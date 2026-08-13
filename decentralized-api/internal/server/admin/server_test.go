@@ -123,7 +123,7 @@ func setupTestServer(t *testing.T) (*Server, *apiconfig.ConfigManager, *mlnodecl
 	}).Return(modelEpochData, nil)
 
 	// 3. PhaseTracker
-	phaseTracker := chainphase.NewChainPhaseTracker()
+	phaseTracker := &chainphase.ChainPhaseTracker{}
 	phaseTracker.Update(
 		chainphase.BlockInfo{Height: 1, Hash: "hash-1"},
 		&types.Epoch{Index: 100, PocStartBlockHeight: 100},
@@ -136,7 +136,7 @@ func setupTestServer(t *testing.T) (*Server, *apiconfig.ConfigManager, *mlnodecl
 	nodeBroker := broker.NewBroker(bridge, phaseTracker, mockParticipant, "", mockClientFactory, configManager)
 
 	// 5. Server
-	s := NewServer(mockCosmos, nodeBroker, configManager, nil, nil, nil)
+	s := NewServer(mockCosmos, nodeBroker, configManager, nil, nil)
 
 	return s, configManager, mockClientFactory
 }

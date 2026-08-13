@@ -3,12 +3,12 @@
 ################################################################################
 # Build the application
 ################################################################################
-FROM golang:1.24.2-alpine3.20 AS builder
+FROM golang:1.25.9-alpine3.23 AS builder
 
-ARG BUILD_FLAGS
 ARG GOOS
 ARG GOARCH
 ARG BLST_PORTABLE=0
+ARG DEVSHARD_VERSION=dev
 
 ENV GOOS=${GOOS} \
     GOARCH=${GOARCH} \
@@ -39,6 +39,7 @@ RUN if [ "$GOARCH" = "arm64" ]; then \
     fi
 
 COPY inference-chain/ /app/inference-chain
+COPY common/ /app/common
 
 WORKDIR /app/decentralized-api
 COPY decentralized-api/go.mod decentralized-api/go.sum ./
@@ -50,7 +51,7 @@ RUN --mount=type=cache,id=go-build-cache3,target=/root/.cache/go-build \
 
 COPY decentralized-api/. .
 
-# ARG LDFLAGS
+ARG LDFLAGS
 RUN --mount=type=cache,id=go-build-cache3,target=/root/.cache/go-build \
     --mount=type=cache,id=go-mod-cache3,target=/go/pkg/mod \
     if [ "$BLST_PORTABLE" = "1" ]; then export CGO_CFLAGS="$CGO_CFLAGS -D__BLST_PORTABLE__"; fi; \
@@ -77,14 +78,14 @@ FROM scratch AS binary-exporter
 # Copy all required files to a flat structure
 COPY --from=builder /app/decentralized-api/build/dapi /build_output/decentralized-api
 COPY --from=builder /app/inference-chain/build/inferenced /build_output/inferenced
-COPY --from=builder /lib/libwasmvm_muslc.x86_64.a /build_output/libwasmvm_muslc.x86_64.a
+COPY --from=builder /lib/libwasmvm_muslc.*.a /build_output/
 COPY --from=builder /usr/lib/libgcc_s.so.1 /build_output/libgcc_s.so.1
 
 ################################################################################
 # Final image
 ################################################################################
 ARG TARGETPLATFORM
-FROM --platform=$TARGETPLATFORM alpine:3.18 AS final
+FROM --platform=$TARGETPLATFORM alpine:3.21 AS final
 
 ARG GOOS
 ARG GOARCH

@@ -9,34 +9,16 @@ import (
 
 func RegisterInterfaces(registry cdctypes.InterfaceRegistry) {
 	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgStartInference{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgFinishInference{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgSubmitNewParticipant{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgValidation{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgSubmitNewUnfundedParticipant{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgInvalidateInference{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgRevalidateInference{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgClaimRewards{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgSubmitPocBatch{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgSubmitPocValidation{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgSubmitPocValidationsV2{},
@@ -57,46 +39,13 @@ func RegisterInterfaces(registry cdctypes.InterfaceRegistry) {
 		&MsgRegisterModel{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgCreateTrainingTask{},
+		&MsgDeleteGovernanceModel{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgSubmitHardwareDiff{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgClaimTrainingTaskForAssignment{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgAssignTrainingTask{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgCreatePartialUpgrade{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgSubmitTrainingKvRecord{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgJoinTraining{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgTrainingHeartbeat{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgSetBarrier{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgJoinTrainingStatus{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgCreateDummyTrainingTask{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgAddUserToTrainingAllowList{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgRemoveUserFromTrainingAllowList{},
-	)
-	registry.RegisterImplementations((*sdk.Msg)(nil),
-		&MsgSetTrainingAllowList{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgRegisterLiquidityPool{},
@@ -108,12 +57,52 @@ func RegisterInterfaces(registry cdctypes.InterfaceRegistry) {
 		&MsgRequestBridgeMint{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgCancelBridgeOperation{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgGovernanceCancelBridgeOperation{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgAddParticipantsToAllowList{},
 	)
 	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgRemoveParticipantsFromAllowList{},
 	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgBridgeExchange{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgRegisterBridgeAddresses{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgRegisterTokenMetadata{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgApproveBridgeTokenForTrading{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgRegisterWrappedTokenContract{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgMigrateAllWrappedTokens{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgApproveIbcTokenForTrading{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgRegisterIbcTokenMetadata{},
+	)
 	// this line is used by starport scaffolding # 3
+
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgSetPoCDelegation{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgRefusePoCDelegation{},
+	)
+	registry.RegisterImplementations((*sdk.Msg)(nil),
+		&MsgDeclarePoCIntent{},
+	)
 
 	registry.RegisterImplementations((*sdk.Msg)(nil),
 		&MsgUpdateParams{},

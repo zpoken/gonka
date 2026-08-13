@@ -215,7 +215,7 @@ kv client chain-id "$CHAIN_ID"
 kv client keyring-backend "$KEYRING_BACKEND"
 kv config p2p.external_address "$P2P_EXTERNAL_ADDRESS" --skip-validate
 sed -Ei 's/^laddr = ".*:26657"$/laddr = "tcp:\/\/0\.0\.0\.0:26657"/g' $STATE_DIR/config/config.toml
-sed -Ei 's/^address = ".*:9090"$/address = "0\.0\.0\.0:9090"/g' $STATE_DIR/config/app.toml
+# gRPC bind (0.0.0.0:9090) comes from app_overrides.toml via update_configs when REST_API_ACTIVE=true.
 configure_tmkms
 update_configs
 
@@ -223,6 +223,11 @@ update_configs
 kv app state-sync.snapshot-interval    "$SNAPSHOT_INTERVAL"
 kv app state-sync.snapshot-keep-recent "$SNAPSHOT_KEEP_RECENT"
 
+# Disable IAVL fast node: cause failed state sync
+kv app iavl-disable-fastnode true
+
+# Query gas limit (protects from expensive read queries)
+kv app query-gas-limit "${QUERY_GAS_LIMIT:-10000000}"
 
 # CONFIG_* environment overrides ----------------------------------------------
 (
@@ -240,6 +245,18 @@ update_configs
 if [ ! -d "$STATE_DIR/cosmovisor" ]; then
   echo "Initialising cosmovisor directory"
   run cosmovisor init /usr/bin/inferenced
+fi
+
+###############################################################################
+# Restore current binary from image if missing (e.g. upgrade binary was removed)
+###############################################################################
+COSMOVISOR_CURRENT_BIN="$STATE_DIR/cosmovisor/current/bin/inferenced"
+if [ -e "$STATE_DIR/cosmovisor/current" ] && { [ ! -x "$COSMOVISOR_CURRENT_BIN" ] || [ ! -f "$COSMOVISOR_CURRENT_BIN" ]; }; then
+  if [ -x /usr/bin/inferenced ]; then
+    echo "Current cosmovisor binary missing or not executable; restoring from image"
+    mkdir -p "$(dirname "$COSMOVISOR_CURRENT_BIN")"
+    cp -f /usr/bin/inferenced "$COSMOVISOR_CURRENT_BIN"
+  fi
 fi
 
 ###############################################################################

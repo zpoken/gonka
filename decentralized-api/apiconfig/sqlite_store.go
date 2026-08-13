@@ -103,9 +103,86 @@ CREATE TABLE IF NOT EXISTS seed_info (
   claimed BOOLEAN NOT NULL DEFAULT 0,
   is_active BOOLEAN NOT NULL DEFAULT 1,
   created_at DATETIME NOT NULL DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f','now'))
+);
+
+CREATE TABLE IF NOT EXISTS bls_dealer_openings (
+  epoch_id INTEGER NOT NULL,
+  recipient_index INTEGER NOT NULL,
+  ciphertext_index INTEGER NOT NULL,
+  slot_index INTEGER NOT NULL,
+  share_bytes BLOB NOT NULL,
+  seed BLOB NOT NULL,
+  updated_at DATETIME NOT NULL DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f','now')),
+  created_at DATETIME NOT NULL DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f','now')),
+  PRIMARY KEY(epoch_id, recipient_index, ciphertext_index)
+);
+CREATE INDEX IF NOT EXISTS idx_bls_dealer_openings_epoch_id ON bls_dealer_openings(epoch_id);
+
+CREATE TABLE IF NOT EXISTS bridge_state (
+  chain_id TEXT PRIMARY KEY,
+  latest_block INTEGER NOT NULL,
+  updated_at DATETIME NOT NULL DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f','now'))
 );`
 	_, err := db.ExecContext(ctx, stmt)
 	return err
+}
+
+// GetBridgeLatestBlock retrieves the latest successfully processed block number for a chain.
+// If the chain has no row yet, it returns (0, false, nil) to indicate an uninitialized chain.
+func GetBridgeLatestBlock(ctx context.Context, db *sql.DB, chain string) (uint64, bool, error) {
+	if db == nil {
+		return 0, false, errors.New("db is nil")
+	}
+	var latest uint64
+	err := db.QueryRowContext(ctx, "SELECT latest_block FROM bridge_state WHERE chain_id = ?", chain).Scan(&latest)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return latest, true, nil
+}
+
+// SetBridgeLatestBlock upserts the latest processed block number for a chain.
+func SetBridgeLatestBlock(ctx context.Context, db *sql.DB, chain string, blockNum uint64) error {
+	if db == nil {
+		return errors.New("db is nil")
+	}
+	_, err := db.ExecContext(ctx, `
+INSERT INTO bridge_state (chain_id, latest_block, updated_at)
+VALUES (?, ?, STRFTIME('%Y-%m-%d %H:%M:%f','now'))
+ON CONFLICT(chain_id) DO UPDATE SET
+  latest_block = excluded.latest_block,
+  updated_at = STRFTIME('%Y-%m-%d %H:%M:%f','now')
+`, chain, blockNum)
+	return err
+}
+
+// LoadAllBridgeLatestBlocks retrieves the latest block numbers for all chains as a map.
+func LoadAllBridgeLatestBlocks(ctx context.Context, db *sql.DB) (map[string]uint64, error) {
+	if db == nil {
+		return nil, errors.New("db is nil")
+	}
+	rows, err := db.QueryContext(ctx, "SELECT chain_id, latest_block FROM bridge_state")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	res := make(map[string]uint64)
+	for rows.Next() {
+		var chain string
+		var latest uint64
+		if err := rows.Scan(&chain, &latest); err != nil {
+			return nil, err
+		}
+		res[chain] = latest
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 // UpsertInferenceNodes replaces or inserts the given nodes by id.
@@ -348,6 +425,104 @@ func IsSeedClaimed(ctx context.Context, db *sql.DB, seedType string) (claimed bo
 		return false, false, err
 	}
 	return c, true, nil
+}
+
+type BLSDealerOpening struct {
+	EpochID         uint64
+	RecipientIndex  uint32
+	CiphertextIndex uint32
+	SlotIndex       uint32
+	ShareBytes      []byte
+	Seed            []byte
+}
+
+func UpsertBLSDealerOpening(ctx context.Context, db *sql.DB, opening BLSDealerOpening) error {
+	return UpsertBLSDealerOpenings(ctx, db, []BLSDealerOpening{opening})
+}
+
+func UpsertBLSDealerOpenings(ctx context.Context, db *sql.DB, openings []BLSDealerOpening) error {
+	if db == nil {
+		return errors.New("db is nil")
+	}
+	if len(openings) == 0 {
+		return nil
+	}
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	q := `INSERT INTO bls_dealer_openings (
+  epoch_id, recipient_index, ciphertext_index, slot_index, share_bytes, seed
+) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(epoch_id, recipient_index, ciphertext_index) DO UPDATE SET
+  slot_index = excluded.slot_index,
+  share_bytes = excluded.share_bytes,
+  seed = excluded.seed,
+  updated_at = (STRFTIME('%Y-%m-%d %H:%M:%f','now'))`
+	stmt, err := tx.PrepareContext(ctx, q)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, opening := range openings {
+		if _, err := stmt.ExecContext(
+			ctx,
+			opening.EpochID,
+			opening.RecipientIndex,
+			opening.CiphertextIndex,
+			opening.SlotIndex,
+			opening.ShareBytes,
+			opening.Seed,
+		); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func ReadBLSDealerOpenings(ctx context.Context, db *sql.DB) ([]BLSDealerOpening, error) {
+	if db == nil {
+		return nil, errors.New("db is nil")
+	}
+	rows, err := db.QueryContext(ctx, `
+SELECT epoch_id, recipient_index, ciphertext_index, slot_index, share_bytes, seed
+FROM bls_dealer_openings`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]BLSDealerOpening, 0)
+	for rows.Next() {
+		var opening BLSDealerOpening
+		if err := rows.Scan(
+			&opening.EpochID,
+			&opening.RecipientIndex,
+			&opening.CiphertextIndex,
+			&opening.SlotIndex,
+			&opening.ShareBytes,
+			&opening.Seed,
+		); err != nil {
+			return nil, err
+		}
+		result = append(result, opening)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func DeleteBLSDealerOpeningsByEpoch(ctx context.Context, db *sql.DB, epochID uint64) error {
+	if db == nil {
+		return errors.New("db is nil")
+	}
+	_, err := db.ExecContext(ctx, `DELETE FROM bls_dealer_openings WHERE epoch_id = ?`, epochID)
+	return err
 }
 
 // ExportAllDb returns a JSON-friendly dump of all user tables in the database.

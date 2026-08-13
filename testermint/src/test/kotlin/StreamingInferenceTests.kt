@@ -27,8 +27,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
+// Classic inference flow was removed (PR #1386); these tests exercise the deprecated endpoints.
+@Tag("exclude")
 @Timeout(value = 20, unit = TimeUnit.MINUTES)
-
 class StreamingInferenceTests : TestermintTest() {
     @Test
     @Tag("sanity")
@@ -42,12 +43,16 @@ class StreamingInferenceTests : TestermintTest() {
         val inferenceResult = getStreamingInferenceResult(genesis)
         logSection("Verifying inference changes")
         val afterBalances = genesis.api.getParticipants()
-        val expectedCoinBalanceChanges = expectedCoinBalanceChanges(listOf(inferenceResult.inference))
-        expectedCoinBalanceChanges.forEach { (address, change) ->
-            assertThat(afterBalances.first { it.id == address }.coinsOwed).isEqualTo(
-                beforeBalances.first { it.id == address }.coinsOwed + change
-            )
+        val totalCoinsOwedDelta = afterBalances.sumOf { participant ->
+            participant.coinsOwed - beforeBalances.first { it.id == participant.id }.coinsOwed
         }
+
+        assertThat(totalCoinsOwedDelta).isEqualTo(inferenceResult.inference.actualCost)
+        assertThat(
+            afterBalances.any { participant ->
+                participant.coinsOwed > beforeBalances.first { it.id == participant.id }.coinsOwed
+            }
+        ).describedAs("Streaming inference should create an immediate owed balance for at least one participant").isTrue()
     }
 
     @Test
@@ -153,12 +158,19 @@ class StreamingInferenceTests : TestermintTest() {
             ChatMessage("user", content)
         )))
 
+        // Wait for the inference to leave VOTING status so coinsOwed is settled
+        if (inferenceResult.inference.statusEnum == com.productscience.data.InferenceStatus.VOTING) {
+            Logger.info("Inference is in VOTING status, waiting for voting to resolve...")
+            genesis.node.waitForNextBlock(5)
+        }
+
         logSection("Verifying some payment was made despite interruption")
         val afterBalances = genesis.api.getParticipants()
 
-        // Log the inference status and other details for debugging
-        Logger.info("Inference status: ${inferenceResult.inference.status}")
-        Logger.info("Inference actual cost: ${inferenceResult.inference.actualCost}")
+        // Re-fetch inference to get updated status after voting
+        val finalInference = genesis.api.getInference(inferenceResult.inference.inferenceId)
+        Logger.info("Inference status: ${finalInference.status}")
+        Logger.info("Inference actual cost: ${finalInference.actualCost}")
 
         // Get the executor (assignedTo) from the inference result
         val executor = inferenceResult.inference.assignedTo

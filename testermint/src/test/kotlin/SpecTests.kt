@@ -57,24 +57,6 @@ class TxMessageSerializationTests {
         println(blsData)
     }
 
-    @Test
-    fun `full transaction`() {
-        val transaction = Transaction(
-            body = TransactionBody(
-                messages = listOf(
-                    MsgStartInference(
-                        creator = "creator",
-                        inferenceId = "fjdsafdsa",
-                        promptHash = "",
-                        promptPayload = "test"
-                    )
-                ),
-                memo = "",
-                timeoutHeight = 0
-            )
-        )
-        println(cosmosJson.toJson(transaction))
-    }
 }
 
 
@@ -153,12 +135,6 @@ class SpecTests {
         }
         val merged = spec1.merge(spec2)
         println(merged.toJson(cosmosJson))
-    }
-
-    @Test
-    fun `parse top miner`() {
-        val topMiners = cosmosJson.fromJson(topMinerJson, TopMinersResponse::class.java)
-        println(topMiners)
     }
 
     @Test
@@ -249,24 +225,6 @@ data class Person(val name: String, val age: Int, val gender: String, val camelC
 data class WithCoins(val coins: List<Coin>)
 
 data class WithDuration(val duration: Duration)
-
-
-val topMinerJson = """
-    {
-      "top_miner": [
-        {
-          "address": "cosmos1nrsklffzkzj3lhrmup3vwx9xv8usnz8wqdv0pr",
-          "last_qualified_started": "1739651467",
-          "last_updated_time": "1739651467",
-          "first_qualified_started": "1739651467"
-        }
-      ],
-      "pagination": {
-        "total": "1"
-      }
-    }
-""".trimIndent()
-
 
 val blsDataJson = """
     {

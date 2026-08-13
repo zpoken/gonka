@@ -1,12 +1,16 @@
-.PHONY: all install build build-docker init clean-state mock-expected-keepers docker-push release build-all package deploy
+.PHONY: all install build build-docker init clean-state mock-expected-keepers docker-push release build-all package deploy test generate
 
 BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 COMMIT := $(shell git log -1 --format='%H')
 
 VERSION ?= $(shell git describe --always)
+DEVSHARD_VERSION ?= $(VERSION)
 BLST_PORTABLE ?= 0
 SET_LATEST ?= 0
 SET_LATEST := $(shell if [ "$(SET_LATEST)" = "1" ]; then echo 1; else echo 0; fi)
+PLATFORM ?= linux/amd64
+GOOS ?= linux
+GOARCH ?= amd64
 
 ldflags = -X github.com/cosmos/cosmos-sdk/version.Name=decentralized-api \
 	-X github.com/cosmos/cosmos-sdk/version.AppName=decentralized-api \
@@ -17,20 +21,32 @@ BUILD_FLAGS ?= -ldflags '$(ldflags)'
 
 WASMVM_STATIC_LINUX_X64_URL := https://github.com/CosmWasm/wasmvm/releases/download/v2.2.4/libwasmvm_muslc.x86_64.a
 
+USE_REGISTRY_CACHE ?= 0
+GHCR_CACHE_NAMESPACE ?= gonka-ai
+ifeq ($(USE_REGISTRY_CACHE),1)
+DOCKER_CACHE_ARGS := --cache-from type=registry,ref=ghcr.io/$(GHCR_CACHE_NAMESPACE)/api:buildcache --cache-to type=registry,ref=ghcr.io/$(GHCR_CACHE_NAMESPACE)/api:buildcache,mode=min
+DOCKER_CACHE_ARGS_UPGRADE := --cache-from type=registry,ref=ghcr.io/$(GHCR_CACHE_NAMESPACE)/api:buildcache-upgrade --cache-to type=registry,ref=ghcr.io/$(GHCR_CACHE_NAMESPACE)/api:buildcache-upgrade,mode=min
+DOCKER_BUILD_PREFIX := docker buildx build --load $(DOCKER_CACHE_ARGS)
+DOCKER_BUILD_UPGRADE_PREFIX := docker buildx build $(DOCKER_CACHE_ARGS_UPGRADE)
+else
+DOCKER_CACHE_ARGS :=
+DOCKER_CACHE_ARGS_UPGRADE :=
+DOCKER_BUILD_PREFIX := DOCKER_BUILDKIT=1 docker build
+DOCKER_BUILD_UPGRADE_PREFIX := DOCKER_BUILDKIT=1 docker build
+endif
+
 define DOCKER_BUILD
 	@echo "--> building decentralized-api docker image"
 	@echo "    	platform: $(PLATFORM)"
-	@echo "    	BUILD_FLAGS: $(BUILD_FLAGS)"
 	@echo "    	GOOS: $(GOOS)"
 	@echo "    	GOARCH: $(GOARCH)"
-	@DOCKER_BUILDKIT=1 \
-	docker build \
-		--load \
+	@$(DOCKER_BUILD_PREFIX) \
 		--platform $(PLATFORM) \
-		--build-arg BUILD_FLAGS="$(BUILD_FLAGS)" \
+		--build-arg LDFLAGS='$(ldflags)' \
 		--build-arg GOOS=$(GOOS) \
 		--build-arg GOARCH=$(GOARCH) \
 		--build-arg BLST_PORTABLE=$(BLST_PORTABLE) \
+		--build-arg DEVSHARD_VERSION=$(DEVSHARD_VERSION) \
 		-f $(DOCKER_FILE) \
 		.. \
 		-t $(DOCKER_TAG)
@@ -39,14 +55,14 @@ endef
 define DOCKER_BUILD_UPGRADE
 	@echo "--> building decentralized-api docker image"
 	@echo "    	platform: $(PLATFORM)"
-	@echo "    	BUILD_FLAGS: $(BUILD_FLAGS)"
 	@echo "    	GOOS: $(GOOS)"
 	@echo "    	GOARCH: $(GOARCH)"
-	@docker build \
+	@$(DOCKER_BUILD_UPGRADE_PREFIX) \
 		--platform $(PLATFORM) \
-		--build-arg BUILD_FLAGS="$(BUILD_FLAGS)" \
+		--build-arg LDFLAGS='$(ldflags)' \
 		--build-arg GOOS=$(GOOS) \
 		--build-arg GOARCH=$(GOARCH) \
+		--build-arg DEVSHARD_VERSION=$(DEVSHARD_VERSION) \
 		--target binary-exporter \
 		-f $(DOCKER_FILE) \
 		--output type=local,dest=./output \
@@ -98,30 +114,26 @@ docker-push:
 	fi
 
 build-for-upgrade:
-	$(eval PLATFORM=linux/amd64)
-	$(eval GOOS=linux)
-	$(eval GOARCH=amd64)
 	$(eval DOCKER_FILE=Dockerfile)
 	$(DOCKER_BUILD_UPGRADE)
-	@echo "--> clearing out ../public-html/v2/dapi"
-	@rm -rf ../public-html/v2/dapi/*
+	@echo "--> staging decentralized-api binary and dependencies for $(GOARCH)"
 	@mkdir -p ../public-html/v2/dapi
-	@echo "--> copying built decentralized-api binary and dependencies to ../public-html/v2/dapi/"
-	@cp ./output/build_output/* ../public-html/v2/dapi/
+	@rm -rf ./output/upgrade-package-$(GOARCH)
+	@mkdir -p ./output/upgrade-package-$(GOARCH)
+	@cp ./output/build_output/* ./output/upgrade-package-$(GOARCH)/
+	@echo "--> zipping decentralized-api binary with dependencies for $(GOARCH)"
+	# We set the timestamp to a const and strip metadata in zip so we have a reproduceable checksum
+	@TZ=UTC find ./output/upgrade-package-$(GOARCH) -type f -exec touch -t 200001010000 {} \;
+	@archive_path="$$(pwd)/../public-html/v2/dapi/decentralized-api-$(GOARCH).zip"; \
+		rm -f "$$archive_path"; \
+		cd ./output/upgrade-package-$(GOARCH) && zip -X -r "$$archive_path" .
+	@echo "--> generating shasum for decentralized-api-$(GOARCH).zip"
+	@shasum -a 256 ../public-html/v2/dapi/decentralized-api-$(GOARCH).zip
+	@echo "--> appending to ../public-html/v2/checksums.txt"
+	@checksum=$$(shasum -a 256 ../public-html/v2/dapi/decentralized-api-$(GOARCH).zip | awk '{print $$1}'); \
+		echo "decentralized-api-$(GOARCH).zip $$checksum" >> ../public-html/v2/checksums.txt
 	@echo "--> cleaning up intermediate build output"
 	@rm -rf ./output
-	@echo "--> zipping decentralized-api binary with dependencies"
-	# We set the timestamp to a const and strip metadata in zip so we have a reproduceable checksum
-	@TZ=UTC find ../public-html/v2/dapi -type f -exec touch -t 200001010000 {} \;
-	@cd ../public-html/v2/dapi && zip -X -r decentralized-api-amd64.zip .
-	@echo "--> generating shasum for decentralized-api-amd64.zip"
-	@shasum -a 256 ../public-html/v2/dapi/decentralized-api-amd64.zip
-	@echo "--> appending to ../public-html/v2/checksums.txt"
-	@echo "decentralized-api-amd64.zip $(shasum -a 256 ../public-html/v2/dapi/decentralized-api-amd64.zip)" >> ../public-html/v2/checksums.txt
-
-	# Disabled ARM builds as requested
-build-for-upgrade-arm:
-	@echo "ARM builds disabled"
 
 download-linux-deps:
 	@echo "--> Downloading static wasmvm library for Linux (x86_64)..."
@@ -132,6 +144,18 @@ download-linux-deps:
 	@ln -sf libwasmvm_muslc.x86_64.a build/deps/libwasmvm_muslc.a
 	@echo "API dependencies downloaded to ./build/deps/"
 
+generate:
+	@echo "--> running go generate"
+	@go generate ./...
+
+.PHONY: ci-testenv-nodemanager
+ci-testenv-nodemanager:
+	@echo "--> nodemanager + runtimeconfig delegation tests"
+	@go test ./nodemanager/... -count=1
+
+test:
+	@echo "--> running tests"
+	@go test ./... -timeout 120s
 #################################################
 # CROSS-COMPILATION SECTION
 #################################################

@@ -1,6 +1,7 @@
 package poc
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"decentralized-api/cosmosclient"
+	"decentralized-api/poc/artifacts"
+
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -94,6 +99,33 @@ func TestValidateLeafCoverage_SingleLeaf(t *testing.T) {
 	assert.NoError(t, validateLeafCoverage([]uint32{42}, []ProofItem{{LeafIndex: 42}}))
 }
 
+func TestValidateNonceCoverage_ExactMatch(t *testing.T) {
+	requested := []int32{10, 20}
+	proofs := []ProofItem{
+		{NonceValue: 20},
+		{NonceValue: 10},
+	}
+	assert.NoError(t, validateNonceCoverage(requested, proofs))
+}
+
+func TestValidateNonceCoverage_MissingNonce(t *testing.T) {
+	err := validateNonceCoverage([]int32{10, 20}, []ProofItem{{NonceValue: 10}})
+	assert.True(t, errors.Is(err, ErrNonceAbsent))
+	assert.Contains(t, err.Error(), "missing nonce")
+}
+
+func TestValidateNonceCoverage_UnexpectedNonce(t *testing.T) {
+	err := validateNonceCoverage([]int32{10}, []ProofItem{{NonceValue: 11}})
+	assert.True(t, errors.Is(err, ErrIncompleteCoverage))
+	assert.Contains(t, err.Error(), "unexpected nonce")
+}
+
+func TestValidateNonceCoverage_DuplicateNonce(t *testing.T) {
+	err := validateNonceCoverage([]int32{10}, []ProofItem{{NonceValue: 10}, {NonceValue: 10}})
+	assert.True(t, errors.Is(err, ErrIncompleteCoverage))
+	assert.Contains(t, err.Error(), "duplicate nonce")
+}
+
 func TestCheckDuplicateNonces_NoDuplicates(t *testing.T) {
 	artifacts := []VerifiedArtifact{
 		{Nonce: 1},
@@ -139,10 +171,14 @@ func TestCheckDuplicateNonces_NegativeDuplicates(t *testing.T) {
 }
 
 func TestValidateFP16Vector_ValidVector(t *testing.T) {
-	// Construct valid FP16 values (no NaN/Infinity)
-	// Using values extracted from real vectors, excluding the NaN bytes
-	validBytes := []byte{0x26, 0x3b, 0x7f, 0x39, 0x66, 0x3a} // 3 valid FP16 values
-	assert.NoError(t, ValidateFP16Vector(validBytes))
+	// Construct valid 12-element FP16 vector (DefaultKDim=12, so 24 bytes)
+	validBytes := make([]byte, DefaultKDim*2)
+	for i := 0; i < len(validBytes); i += 2 {
+		// 0x3c00 = 1.0 in FP16
+		validBytes[i] = 0x00
+		validBytes[i+1] = 0x3c
+	}
+	assert.NoError(t, ValidateFP16Vector(validBytes, DefaultKDim))
 }
 
 func TestValidateFP16Vector_RealVectorsWithNaN(t *testing.T) {
@@ -167,7 +203,7 @@ func TestValidateFP16Vector_RealVectorsWithNaN(t *testing.T) {
 			vectorBytes, err := base64.StdEncoding.DecodeString(tc.b64)
 			require.NoError(t, err)
 
-			err = ValidateFP16Vector(vectorBytes)
+			err = ValidateFP16Vector(vectorBytes, DefaultKDim)
 			assert.Error(t, err)
 			assert.Contains(t, err.Error(), "NaN")
 			// Verify error reports correct byte offset
@@ -178,70 +214,103 @@ func TestValidateFP16Vector_RealVectorsWithNaN(t *testing.T) {
 }
 
 func TestValidateFP16Vector_WithPositiveInfinity(t *testing.T) {
-	// 0x7c00 = +Infinity (exp=31, frac=0)
-	infBytes := []byte{0x00, 0x7c}
-	err := ValidateFP16Vector(infBytes)
+	// Build 12-element vector with +Infinity at position 0
+	infBytes := make([]byte, DefaultKDim*2)
+	infBytes[0] = 0x00
+	infBytes[1] = 0x7c // 0x7c00 = +Infinity (exp=31, frac=0)
+	err := ValidateFP16Vector(infBytes, DefaultKDim)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "Infinity")
 }
 
 func TestValidateFP16Vector_WithNegativeInfinity(t *testing.T) {
-	// 0xfc00 = -Infinity (exp=31, frac=0, sign=1)
-	negInfBytes := []byte{0x00, 0xfc}
-	err := ValidateFP16Vector(negInfBytes)
+	// Build 12-element vector with -Infinity at position 0
+	negInfBytes := make([]byte, DefaultKDim*2)
+	negInfBytes[0] = 0x00
+	negInfBytes[1] = 0xfc // 0xfc00 = -Infinity (exp=31, frac=0, sign=1)
+	err := ValidateFP16Vector(negInfBytes, DefaultKDim)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "Infinity")
 }
 
-func TestValidateFP16Vector_OddLength(t *testing.T) {
-	// Odd byte count is invalid for FP16 vector
-	oddBytes := []byte{0x00, 0x3c, 0x00}
-	err := ValidateFP16Vector(oddBytes)
+func TestValidateFP16Vector_WrongLength(t *testing.T) {
+	// Vector with wrong number of elements (3 instead of 12)
+	shortBytes := []byte{0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c} // 3 valid FP16 values
+	err := ValidateFP16Vector(shortBytes, DefaultKDim)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "must be even")
+	assert.Contains(t, err.Error(), "invalid vector length")
+	assert.Contains(t, err.Error(), "got 6 bytes")
+	assert.Contains(t, err.Error(), "expected 24")
 }
 
 func TestValidateFP16Vector_Empty(t *testing.T) {
-	assert.NoError(t, ValidateFP16Vector(nil))
-	assert.NoError(t, ValidateFP16Vector([]byte{}))
+	// Empty vectors should fail with length mismatch
+	err := ValidateFP16Vector(nil, DefaultKDim)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid vector length")
+	assert.Contains(t, err.Error(), "got 0 bytes")
+
+	err = ValidateFP16Vector([]byte{}, DefaultKDim)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid vector length")
 }
 
 func TestValidateFP16Vector_QuietNaN(t *testing.T) {
+	// Build 12-element vector with quiet NaN at position 0
 	// 0x7e00 = quiet NaN (exp=31, frac=512) - the exact value found in all_nonces.json
-	qnanBytes := []byte{0x00, 0x7e}
-	err := ValidateFP16Vector(qnanBytes)
+	qnanBytes := make([]byte, DefaultKDim*2)
+	qnanBytes[0] = 0x00
+	qnanBytes[1] = 0x7e
+	err := ValidateFP16Vector(qnanBytes, DefaultKDim)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "NaN")
 	assert.Contains(t, err.Error(), "0x7e00")
 }
 
 func TestValidateFP16Vector_SignalingNaN(t *testing.T) {
+	// Build 12-element vector with signaling NaN at position 0
 	// 0x7c01 = signaling NaN (exp=31, frac=1)
-	snanBytes := []byte{0x01, 0x7c}
-	err := ValidateFP16Vector(snanBytes)
+	snanBytes := make([]byte, DefaultKDim*2)
+	snanBytes[0] = 0x01
+	snanBytes[1] = 0x7c
+	err := ValidateFP16Vector(snanBytes, DefaultKDim)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "NaN")
 }
 
 func TestValidateFP16Vector_NegativeNaN(t *testing.T) {
+	// Build 12-element vector with negative quiet NaN at position 0
 	// 0xfe00 = negative quiet NaN (sign=1, exp=31, frac=512)
-	negNanBytes := []byte{0x00, 0xfe}
-	err := ValidateFP16Vector(negNanBytes)
+	negNanBytes := make([]byte, DefaultKDim*2)
+	negNanBytes[0] = 0x00
+	negNanBytes[1] = 0xfe
+	err := ValidateFP16Vector(negNanBytes, DefaultKDim)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "NaN")
 }
 
 func TestValidateFP16Vector_ValidWithSubnormals(t *testing.T) {
 	// Subnormal values (exp=0, frac!=0) should be allowed - they are valid small numbers
+	subnormalBytes := make([]byte, DefaultKDim*2)
 	// 0x0001 = smallest positive subnormal
-	subnormalBytes := []byte{0x01, 0x00, 0xff, 0x03} // two subnormals
-	assert.NoError(t, ValidateFP16Vector(subnormalBytes))
+	subnormalBytes[0] = 0x01
+	subnormalBytes[1] = 0x00
+	// 0x03ff = largest positive subnormal
+	subnormalBytes[2] = 0xff
+	subnormalBytes[3] = 0x03
+	assert.NoError(t, ValidateFP16Vector(subnormalBytes, DefaultKDim))
 }
 
 func TestValidateFP16Vector_ValidZero(t *testing.T) {
 	// 0x0000 = +0, 0x8000 = -0 - both are valid
-	zeroBytes := []byte{0x00, 0x00, 0x00, 0x80}
-	assert.NoError(t, ValidateFP16Vector(zeroBytes))
+	zeroBytes := make([]byte, DefaultKDim*2)
+	// Position 0: +0
+	zeroBytes[0] = 0x00
+	zeroBytes[1] = 0x00
+	// Position 1: -0
+	zeroBytes[2] = 0x00
+	zeroBytes[3] = 0x80
+	assert.NoError(t, ValidateFP16Vector(zeroBytes, DefaultKDim))
 }
 
 // TestErrInvalidVectorData_ErrorWrapping verifies that ErrInvalidVectorData is properly
@@ -250,7 +319,11 @@ func TestValidateFP16Vector_ValidZero(t *testing.T) {
 func TestErrInvalidVectorData_ErrorWrapping(t *testing.T) {
 	// Simulate what FetchAndVerifyProofs does when it detects invalid vector data
 	leafIndex := uint32(42)
-	validationErr := ValidateFP16Vector([]byte{0x00, 0x7e}) // NaN
+	// Build 12-element vector with NaN at position 0
+	nanBytes := make([]byte, DefaultKDim*2)
+	nanBytes[0] = 0x00
+	nanBytes[1] = 0x7e // quiet NaN
+	validationErr := ValidateFP16Vector(nanBytes, DefaultKDim)
 	wrappedErr := fmt.Errorf("%w: leaf %d: %v", ErrInvalidVectorData, leafIndex, validationErr)
 
 	// This is exactly how validateParticipant checks for permanent failures
@@ -347,7 +420,7 @@ func TestFetchAndVerifyProofs_RejectsNaNVector(t *testing.T) {
 	require.NoError(t, err)
 
 	// This is what FetchAndVerifyProofs does internally
-	err = ValidateFP16Vector(vectorBytes)
+	err = ValidateFP16Vector(vectorBytes, DefaultKDim)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "NaN")
 
@@ -359,4 +432,128 @@ func TestFetchAndVerifyProofs_RejectsNaNVector(t *testing.T) {
 
 	// Ensure client is used to avoid unused variable warning
 	_ = client
+}
+
+func TestFetchAndVerifyProofsByNonce_Success(t *testing.T) {
+	store, err := artifacts.OpenSMST(t.TempDir())
+	require.NoError(t, err)
+	defer store.Close()
+
+	vector := make([]byte, DefaultKDim*2)
+	require.NoError(t, store.AddWithNode(42, vector, ""))
+	require.NoError(t, store.Flush())
+	count, rootHash := store.GetFlushedRoot()
+	denseIndex, vector, proof, err := store.GetArtifactAndProofByNonce(42, count)
+	require.NoError(t, err)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/poc/proofs/by-nonce", r.URL.Path)
+
+		var req struct {
+			Nonces []int32 `json:"nonces"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		assert.Equal(t, []int32{42}, req.Nonces)
+
+		resp := ProofResponse{
+			Proofs: []ProofItem{{
+				LeafIndex:   denseIndex,
+				NonceValue:  42,
+				VectorBytes: base64.StdEncoding.EncodeToString(vector),
+				Proof:       proofStrings(proof),
+			}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(resp))
+	}))
+	defer server.Close()
+
+	recorder := &cosmosclient.MockCosmosMessageClient{}
+	recorder.On("GetAccountAddress").Return("validator-address")
+	recorder.On("GetSignerAddress").Return("validator-signer")
+	recorder.On("SignBytes", mock.MatchedBy(func(payload []byte) bool {
+		return len(payload) == 64
+	})).Return([]byte("signature"), nil)
+
+	client := &ProofClient{httpClient: server.Client(), recorder: recorder}
+	verified, err := client.FetchAndVerifyProofsByNonce(context.Background(), server.URL, ProofByNonceRequest{
+		PocStageStartBlockHeight: 100,
+		ModelId:                  "model-a",
+		RootHash:                 rootHash,
+		Count:                    count,
+		Nonces:                   []int32{42},
+		ParticipantAddress:       "participant",
+	})
+	require.NoError(t, err)
+	require.Len(t, verified, 1)
+	assert.Equal(t, denseIndex, verified[0].LeafIndex)
+	assert.Equal(t, int32(42), verified[0].Nonce)
+	recorder.AssertExpectations(t)
+}
+
+func TestFetchAndVerifyProofsByNonce_MissingNonce(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := ProofResponse{Proofs: []ProofItem{}}
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(resp))
+	}))
+	defer server.Close()
+
+	recorder := &cosmosclient.MockCosmosMessageClient{}
+	recorder.On("GetAccountAddress").Return("validator-address")
+	recorder.On("GetSignerAddress").Return("validator-signer")
+	recorder.On("SignBytes", mock.Anything).Return([]byte("signature"), nil)
+
+	client := &ProofClient{httpClient: server.Client(), recorder: recorder}
+	_, err := client.FetchAndVerifyProofsByNonce(context.Background(), server.URL, ProofByNonceRequest{
+		PocStageStartBlockHeight: 100,
+		ModelId:                  "model-a",
+		RootHash:                 make([]byte, 32),
+		Count:                    1,
+		Nonces:                   []int32{42},
+		ParticipantAddress:       "participant",
+	})
+	assert.True(t, errors.Is(err, ErrNonceAbsent))
+	recorder.AssertExpectations(t)
+}
+
+// TestFetchAndVerifyProofsMarksSigningFailureAsLocal keeps a broken keyring from
+// looking like a validatee failure, which would vote -1 against every assigned
+// participant once retries ran out.
+func TestFetchAndVerifyProofsMarksSigningFailureAsLocal(t *testing.T) {
+	recorder := &cosmosclient.MockCosmosMessageClient{}
+	recorder.On("GetAccountAddress").Return("validator-address")
+	recorder.On("GetSignerAddress").Return("validator-signer")
+	recorder.On("SignBytes", mock.Anything).Return([]byte(nil), errors.New("keyring locked"))
+
+	client := &ProofClient{httpClient: http.DefaultClient, recorder: recorder}
+
+	_, err := client.FetchAndVerifyProofs(context.Background(), "http://participant", ProofRequest{
+		PocStageStartBlockHeight: 100,
+		ModelId:                  "model-a",
+		RootHash:                 make([]byte, 32),
+		Count:                    1,
+		LeafIndices:              []uint32{0},
+		ParticipantAddress:       "participant",
+	})
+	assert.True(t, errors.Is(err, ErrLocalRequestFailure))
+
+	_, err = client.FetchAndVerifyProofsByNonce(context.Background(), "http://participant", ProofByNonceRequest{
+		PocStageStartBlockHeight: 100,
+		ModelId:                  "model-a",
+		RootHash:                 make([]byte, 32),
+		Count:                    1,
+		Nonces:                   []int32{42},
+		ParticipantAddress:       "participant",
+	})
+	assert.True(t, errors.Is(err, ErrLocalRequestFailure))
+	recorder.AssertExpectations(t)
+}
+
+func proofStrings(proof [][]byte) []string {
+	out := make([]string, len(proof))
+	for i, hash := range proof {
+		out[i] = base64.StdEncoding.EncodeToString(hash)
+	}
+	return out
 }

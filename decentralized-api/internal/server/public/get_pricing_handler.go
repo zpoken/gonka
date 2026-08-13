@@ -1,56 +1,15 @@
 package public
 
 import (
+	"common/logging"
 	"context"
-	"decentralized-api/logging"
+	"decentralized-api/statsstorage"
 	"net/http"
 	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/productscience/inference/x/inference/types"
 )
-
-func (s *Server) getPricing(ctx echo.Context) error {
-	queryClient := s.recorder.NewInferenceQueryClient()
-	context := s.recorder.GetContext()
-	req := &types.QueryCurrentEpochGroupDataRequest{}
-	response, err := queryClient.CurrentEpochGroupData(context, req)
-	// FIXME: handle epoch 0, there's a default price specifically for that,
-	// 	but at the moment you just return 0 (since when epoch == 0 you get empty struct from CurrentEpochGroupData)
-	if err != nil {
-		return err
-	}
-	unitOfComputePrice := response.EpochGroupData.UnitOfComputePrice
-
-	parentEpochData := response.GetEpochGroupData()
-	models := make([]ModelPriceDto, 0, len(parentEpochData.SubGroupModels))
-
-	for _, modelId := range parentEpochData.SubGroupModels {
-		req := &types.QueryGetEpochGroupDataRequest{
-			EpochIndex: parentEpochData.EpochIndex,
-			ModelId:    modelId,
-		}
-		modelEpochData, err := queryClient.EpochGroupData(context, req)
-		if err != nil {
-			continue
-		}
-
-		if modelEpochData.EpochGroupData.ModelSnapshot != nil {
-			m := modelEpochData.EpochGroupData.ModelSnapshot
-			pricePerToken := m.UnitsOfComputePerToken * uint64(unitOfComputePrice)
-			models = append(models, ModelPriceDto{
-				Id:                     m.Id,
-				UnitsOfComputePerToken: m.UnitsOfComputePerToken,
-				PricePerToken:          pricePerToken,
-			})
-		}
-	}
-
-	return ctx.JSON(http.StatusOK, &PricingDto{
-		Price:  uint64(unitOfComputePrice),
-		Models: models,
-	})
-}
 
 func (s *Server) getGovernancePricing(ctx echo.Context) error {
 	queryClient := s.recorder.NewInferenceQueryClient()
@@ -126,11 +85,11 @@ type ModelMetrics struct {
 }
 
 // getModelMetrics calculates utilization and gets capacity for all models in one go
-func (s *Server) getModelMetrics(queryClient types.QueryClient, context context.Context) map[string]ModelMetrics {
+func (s *Server) getModelMetrics(queryClient types.QueryClient, ctx context.Context) map[string]ModelMetrics {
 	metricsData := make(map[string]ModelMetrics)
 
 	// Get all model capacities in one request
-	capacitiesResponse, err := queryClient.GetAllModelCapacities(context, &types.QueryGetAllModelCapacitiesRequest{})
+	capacitiesResponse, err := queryClient.GetAllModelCapacities(ctx, &types.QueryGetAllModelCapacitiesRequest{})
 	if err != nil {
 		logging.Warn("Failed to get model capacities", types.Pricing, "error", err)
 		return metricsData
@@ -148,27 +107,29 @@ func (s *Server) getModelMetrics(queryClient types.QueryClient, context context.
 	}
 
 	// Get dynamic pricing parameters for time window
-	params, err := queryClient.Params(context, &types.QueryParamsRequest{})
+	params, err := queryClient.Params(ctx, &types.QueryParamsRequest{})
 	if err != nil || params.Params.DynamicPricingParams == nil {
 		return metricsData // Return with capacity data only
 	}
 
 	// Calculate time window (similar to BeginBlocker logic)
-	currentTime := time.Now().Unix()
-	timeWindowStart := currentTime - int64(params.Params.DynamicPricingParams.UtilizationWindowDuration)
+	currentTime := time.Now().UnixMilli()
+	// UtilizationWindowDuration is in seconds, not millis
+	timeWindowStart := currentTime - int64(params.Params.DynamicPricingParams.UtilizationWindowDuration*1000)
 
-	// Get stats for all models in time window
-	statsResponse, err := queryClient.InferencesAndTokensStatsByModels(context, &types.QueryInferencesAndTokensStatsByModelsRequest{
-		TimeFrom: timeWindowStart,
-		TimeTo:   currentTime,
-	})
+	if s.statsStorage == nil {
+		logging.Warn("Stats storage not configured, utilization metrics unavailable", types.Pricing)
+		return metricsData // Return with capacity data only
+	}
+
+	modelStats, err := s.statsStorage.GetModelStatsByTime(ctx, statsstorage.UnixMillis(timeWindowStart), statsstorage.UnixMillis(currentTime))
 	if err != nil {
 		logging.Warn("Failed to get model stats for utilization", types.Pricing, "error", err)
 		return metricsData // Return with capacity data only
 	}
 
 	// Calculate utilization for each model and update metrics
-	for _, modelStat := range statsResponse.StatsModels {
+	for _, modelStat := range modelStats {
 		if capacity, exists := capacityMap[modelStat.Model]; exists && capacity > 0 {
 			// Calculate utilization = tokens_used / capacity
 			utilization := float64(modelStat.AiTokens) / float64(capacity)

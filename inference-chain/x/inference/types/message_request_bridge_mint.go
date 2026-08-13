@@ -11,12 +11,13 @@ import (
 
 var _ sdk.Msg = &MsgRequestBridgeMint{}
 
-func NewMsgRequestBridgeMint(creator, amount, destinationAddress, chainId string) *MsgRequestBridgeMint {
+func NewMsgRequestBridgeMint(creator, amount, destinationAddress, chainId, destinationBridgeAddress string) *MsgRequestBridgeMint {
 	return &MsgRequestBridgeMint{
-		Creator:            creator,
-		Amount:             amount,
-		DestinationAddress: destinationAddress,
-		ChainId:            chainId,
+		Creator:                  creator,
+		Amount:                   amount,
+		DestinationAddress:       destinationAddress,
+		ChainId:                  chainId,
+		DestinationBridgeAddress: destinationBridgeAddress,
 	}
 }
 
@@ -30,6 +31,9 @@ func (msg *MsgRequestBridgeMint) ValidateBasic() error {
 	// Validate amount is not empty and is a valid positive integer
 	if len(msg.Amount) == 0 {
 		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "amount cannot be empty")
+	}
+	if len(msg.Amount) > MaxBridgeAmountDigits {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "amount exceeds %d digits", MaxBridgeAmountDigits)
 	}
 
 	// Parse amount to ensure it's a valid positive integer
@@ -52,6 +56,16 @@ func (msg *MsgRequestBridgeMint) ValidateBasic() error {
 		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "destination address must be a valid Ethereum address")
 	}
 
+	// Validate destination bridge address is not empty
+	if len(msg.DestinationBridgeAddress) == 0 {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "destination bridge address cannot be empty")
+	}
+
+	// Validate bridge address format format
+	if !isValidEthereumAddress(msg.DestinationBridgeAddress) {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "destination bridge address must be a valid Ethereum address")
+	}
+
 	// Validate chain ID is not empty and is supported
 	if len(msg.ChainId) == 0 {
 		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "chain ID cannot be empty")
@@ -63,15 +77,6 @@ func (msg *MsgRequestBridgeMint) ValidateBasic() error {
 	}
 
 	return nil
-}
-
-func (msg *MsgRequestBridgeMint) GetSigners() []sdk.AccAddress {
-	creatorAddr, err := sdk.AccAddressFromBech32(msg.Creator)
-	if err != nil {
-		//nolint:forbidigo // GetSigners can't return error
-		return nil
-	}
-	return []sdk.AccAddress{creatorAddr}
 }
 
 // isValidEthereumAddress validates basic Ethereum address format

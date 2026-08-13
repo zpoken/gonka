@@ -166,11 +166,13 @@ func setupTestKeeper(t *testing.T, ctrl *gomock.Controller) (keeper.Keeper, sdk.
 	upgradeKeeper := keepertest.NewMockUpgradeKeeper(ctrl)
 
 	storeKey := storetypes.NewKVStoreKey(types.StoreKey)
+	transientStoreKey := storetypes.NewTransientStoreKey(types.TransientStoreKey)
 	blsStoreKey := storetypes.NewKVStoreKey(blstypes.StoreKey)
 
 	db := dbm.NewMemDB()
 	stateStore := store.NewCommitMultiStore(db, log.NewNopLogger(), metrics.NewNoOpMetrics())
 	stateStore.MountStoreWithDB(storeKey, storetypes.StoreTypeIAVL, db)
+	stateStore.MountStoreWithDB(transientStoreKey, storetypes.StoreTypeTransient, db)
 	stateStore.MountStoreWithDB(blsStoreKey, storetypes.StoreTypeIAVL, db)
 	require.NoError(t, stateStore.LoadLatestVersion())
 
@@ -188,6 +190,7 @@ func setupTestKeeper(t *testing.T, ctrl *gomock.Controller) (keeper.Keeper, sdk.
 	k := keeper.NewKeeper(
 		cdc,
 		runtime.NewKVStoreService(storeKey),
+		runtime.NewTransientStoreService(transientStoreKey),
 		log.NewNopLogger(),
 		authority.String(),
 		bankKeeper,
@@ -306,7 +309,7 @@ func TestMigrateAuthzGrantsForPocV2_Success(t *testing.T) {
 	expiration := time.Now().Add(24 * time.Hour)
 
 	// Add a MsgStartInference grant
-	mockAuthz.addGrant(granter, grantee, sdk.MsgTypeURL(&types.MsgStartInference{}), &expiration, k.Codec())
+	mockAuthz.addGrant(granter, grantee, types.LegacyMsgStartInferenceTypeURL, &expiration, k.Codec())
 
 	// Run migration
 	err := migrateAuthzGrantsForPocV2(ctx, mockAuthz, k)
@@ -354,7 +357,7 @@ func TestMigrateAuthzGrantsForPocV2_SkipsExistingGrants(t *testing.T) {
 	expiration := time.Now().Add(24 * time.Hour)
 
 	// Add a MsgStartInference grant
-	mockAuthz.addGrant(granter, grantee, sdk.MsgTypeURL(&types.MsgStartInference{}), &expiration, k.Codec())
+	mockAuthz.addGrant(granter, grantee, types.LegacyMsgStartInferenceTypeURL, &expiration, k.Codec())
 
 	// Mark one V2 message type as already existing
 	mockAuthz.addExistingAuth(grantee, granter, sdk.MsgTypeURL(&types.MsgPoCV2StoreCommit{}))
@@ -409,8 +412,8 @@ func TestMigrateAuthzGrantsForPocV2_MultipleGranterGranteePairs(t *testing.T) {
 	expiration := time.Now().Add(24 * time.Hour)
 
 	// Add MsgStartInference grants for both pairs
-	mockAuthz.addGrant(granter1, grantee1, sdk.MsgTypeURL(&types.MsgStartInference{}), &expiration, k.Codec())
-	mockAuthz.addGrant(granter2, grantee2, sdk.MsgTypeURL(&types.MsgStartInference{}), &expiration, k.Codec())
+	mockAuthz.addGrant(granter1, grantee1, types.LegacyMsgStartInferenceTypeURL, &expiration, k.Codec())
+	mockAuthz.addGrant(granter2, grantee2, types.LegacyMsgStartInferenceTypeURL, &expiration, k.Codec())
 
 	// Run migration
 	err := migrateAuthzGrantsForPocV2(ctx, mockAuthz, k)
@@ -449,7 +452,7 @@ func TestMigrateAuthzGrantsForPocV2_IgnoresNonStartInferenceGrants(t *testing.T)
 
 	// Add grants for other message types (not MsgStartInference)
 	mockAuthz.addGrant(granter, grantee, "/some.other.MsgType", &expiration, k.Codec())
-	mockAuthz.addGrant(granter, grantee, sdk.MsgTypeURL(&types.MsgFinishInference{}), &expiration, k.Codec())
+	mockAuthz.addGrant(granter, grantee, sdk.MsgTypeURL(&types.MsgClaimRewards{}), &expiration, k.Codec())
 
 	// Run migration
 	err := migrateAuthzGrantsForPocV2(ctx, mockAuthz, k)
@@ -473,7 +476,7 @@ func TestMigrateAuthzGrantsForPocV2_PreservesExpiration(t *testing.T) {
 	expiration := time.Date(2027, 6, 15, 12, 0, 0, 0, time.UTC)
 
 	// Add a MsgStartInference grant with specific expiration
-	mockAuthz.addGrant(granter, grantee, sdk.MsgTypeURL(&types.MsgStartInference{}), &expiration, k.Codec())
+	mockAuthz.addGrant(granter, grantee, types.LegacyMsgStartInferenceTypeURL, &expiration, k.Codec())
 
 	// Run migration
 	err := migrateAuthzGrantsForPocV2(ctx, mockAuthz, k)
@@ -499,7 +502,7 @@ func TestMigrateAuthzGrantsForPocV2_NilExpiration(t *testing.T) {
 	grantee := sdk.AccAddress([]byte("grantee1___________"))
 
 	// Add a MsgStartInference grant with nil expiration
-	mockAuthz.addGrant(granter, grantee, sdk.MsgTypeURL(&types.MsgStartInference{}), nil, k.Codec())
+	mockAuthz.addGrant(granter, grantee, types.LegacyMsgStartInferenceTypeURL, nil, k.Codec())
 
 	// Run migration
 	err := migrateAuthzGrantsForPocV2(ctx, mockAuthz, k)

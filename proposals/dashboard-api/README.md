@@ -1,7 +1,7 @@
 # Canonical Dashboard API for Gonka
 
 Status: design proposal
-Date: 2026-11-13
+Date: 2026-11-19
 Baseline: `v0.2.16`
 
 ## 1. Problem
@@ -192,16 +192,11 @@ Common practice: the definition of a value lives next to the protocol, and index
 
 ### 5.1. Components
 
-1. **A `/v1/dashboard/*` facade in edge-api** (`common/queryapi`). The single dashboard contract: one observation height, display-ready values, explicit availability for every field.
-2. **A `dashboardcalc` package** in `inference-chain`. Pure Go interpretation functions (contributions, shares, `EffectiveConfirmedWeight`, weight to confirm, collateral bounds, H100, fee budget) plus the field registry. The consensus pipeline and the facade call the same code; `common/go.mod` already depends on `inference-chain`.
-3. **Minimal chain queries**, only for what needs keeper-internal state:
-   - `ActiveParticipants(epoch_index)`;
-   - a batch reward estimate with settlement diagnostics;
-   - batch point lookups of `EpochPerformanceSummary` by address list;
-   - `DevshardHostEpochStats` for all participants, paginated;
-   - `GenesisOnlyParams`.
+1. **A `/v1/dashboard/*` facade in edge-api** (`common/queryapi`). The single dashboard contract: one observation height, display-ready values, explicit availability for every field. dapi does not serve these routes; the proxy publishes them with the other edge-api read routes.
+2. **A `dashboardcalc` package** in `inference-chain/x/inference/dashboardcalc`. Pure Go interpretation functions plus the field registry: contributions, group cap, shares, oversupply, `EffectiveConfirmedWeight`, weight to confirm, collateral formula and bounds, power-cap policy, reward schedule and supply cap, eras and compatibility, epoch state and provenance, and the epoch fee budget. It imports only `types` and `coefficients`. The weight pipeline, settlement, collateral adjustment and the dapi fee estimator call these functions, so the facade and consensus share one implementation; `common/go.mod` already depends on `inference-chain`.
+3. **Minimal read-only chain queries**, only for what needs keeper state (section 5.6).
 
-These queries do not change state and are not added to the Wasm accept list (`app/legacy.go:192-197, 303-332`), so they ship in a `release/vX.Y.Z-postN` patch release without governance. v1 adds no new state.
+The queries do not change state, are not marked module-query-safe and are not added to the Wasm accept list (`app/legacy.go:192-197, 303-332`), so they ship in a `release/vX.Y.Z-postN` patch release without governance. v1 adds no new state.
 
 ### 5.2. Alternatives considered
 
@@ -210,6 +205,7 @@ These queries do not change state and are not added to the Wasm accept list (`ap
 | edge-api only | no access to keeper inputs (reward estimate, `ActiveParticipants`) |
 | `dashboard/v1` queries directly on chain | duplicates the contract and release surface; deferred |
 | A per-epoch display snapshot in state | exact, but costs consensus storage and coordinated activation; a separate decision if exact history becomes a requirement |
+| A per-participant node index in state | removes the full-record decode behind node queries, but adds state; deferred together with snapshots |
 | Spec and conformance tests only | keeps duplicated calculations |
 | Fixing existing queries only | maintainers still assemble the interpretation themselves |
 
@@ -225,6 +221,8 @@ Every response carries three separate values:
 | `interpretation_era` | protocol rules under which the requested epoch was formed |
 | `build` | edge-api and chain binary versions, for diagnostics |
 
+`meta` also carries `compatibility` (`known`, `genesis` or `unknown`) and `support_level` (`full`, `formation` or `stored`).
+
 Epoch milestones:
 
 | Milestone | Source |
@@ -236,34 +234,38 @@ Epoch milestones:
 
 `ActiveParticipants.effective_block_height` is not used: it is the formation height + 2 (`module.go:938`), and at epoch 456 it is 118 blocks earlier than the real activation. CometBFT validator-set activation is a separate milestone.
 
-Eras are determined by formation height relative to upgrade heights in the facade registry; field presence is only checked for consistency.
+**Upgrade registry.** The facade keeps an ordered registry of upgrade names with the era each one starts, for example `v0.2.16 → v0_2_16` (with transition era `v0_2_16_upgrade_epoch`) and `v0.2.17 → v0_2_17`. Heights are not stored: the facade reads each name with `cosmos.upgrade.v1beta1.Query/AppliedPlan` at the observation height, so one build serves mainnet and every testnet. A registered upgrade that has not been applied yet is ignored, so a newer facade works before its newly supported upgrade activates. Operators can replace the registry without a rebuild (`DASHBOARD_ERA_BOUNDARIES`, a JSON array of `{upgrade_name, era, transition_era}`).
 
-| Era | Boundary | Returned |
-|-----|----------|----------|
-| `v0_2_16` | formed after v0.2.16 activation, with known compatibility at the observation height | all fields |
-| `v0_2_16_upgrade_epoch` | formed before activation and effective at the upgrade height | stored values and derived values that do not depend on settlement rules |
-| `legacy` | all other older epochs | stored values only; derived values `unavailable` (`era_not_supported`) |
-| `unknown` | compatibility at the observation height is unknown, and the epoch was formed after the last boundary known to the build | derived values `unavailable` (`unsupported_interpretation`) |
+Eras are determined by formation height relative to the applied upgrade heights; field presence is only checked for consistency.
 
-On a compatible chain, an epoch formed long after the latest known upgrade is classified by its era interval and stays fully supported; `unknown` applies only when the compatibility check below fails.
+| Era | Epochs | Support level | Returned |
+|-----|--------|---------------|----------|
+| `v0_2_16`, `v0_2_17` | formed at or after the upgrade height | `full` | all fields |
+| `v0_2_16_upgrade_epoch` | formed before the v0.2.16 height and settled after it: the next epoch was formed at or after the upgrade height, or is not formed yet | `formation` | stored values, contributions, shares and eligibility; values that depend on settlement rules are `unavailable` (`era_not_supported`) |
+| `legacy` | all other older epochs | `stored` | stored values only; derived values `unavailable` (`era_not_supported`) |
+| `unknown` | compatibility at the observation height is unknown, and the epoch was formed after the last boundary known to the build | `stored` | derived values `unavailable` (`unsupported_interpretation`) |
+
+`v0_2_17` keeps the `v0_2_16` interpretation, so it has no separate transition era: an epoch formed under v0.2.16 and settled under v0.2.17 stays `v0_2_16`. The transition-epoch rule also covers an upgrade during PoC: the epoch formed before the upgrade and settled after it is the transition epoch, not the one effective at the upgrade height. On a compatible chain, an epoch formed long after the latest known upgrade is classified by its era interval and stays fully supported.
 
 Derived values are not reproduced for `legacy` because historical rules differ from current ones: for example, v0.2.12 settlement rescaled `confirmation_weight` through a coefficient-adjusted denominator (`release/v0.2.12`, `bitcoin_rewards.go:615-627`). Adapters for specific older eras can be added later, each tested against its own release.
 
 The unknown-upgrade guard has two levels:
 
-1. **Compatibility at the observation height.** The facade reads `LastUpgradeHeight` and checks it against the chain-specific boundary registry.
-   - **Known:** the value matches a known applied boundary in the registry. Registry entries for upgrades that have not activated yet are ignored, so a newer facade also works before its newly supported upgrade activates. Every epoch is classified by its formation height against the era intervals; epochs formed after the latest applied boundary belong to that era and are fully supported.
-   - **Unknown:** the value is not in the registry, is missing, or the query fails. Calculations based on current rules are disabled for all epochs: reward estimate, settlement diagnostics, `estimated_mintable`, reward per weight, collateral projection, fee budget, `status_at_observation`, cPoC ratio. Stored facts are still returned.
+1. **Compatibility at the observation height.** The facade reads `LastUpgradeHeight` and compares it with the applied registry upgrades.
+   - **Known:** the value equals the height of the newest applied registry upgrade.
+   - **Genesis:** no upgrade is recorded and no registry upgrade is applied (a fresh testnet or Testermint cluster); epochs are interpreted with the newest registry era.
+   - **Unknown:** the value does not match, is missing while registry upgrades are applied, or a compatibility query fails. Calculations based on current rules are disabled for all epochs: reward estimate, settlement diagnostics, `estimated_mintable`, reward per weight, collateral projection, fee budget, live counters, LLRs, `status_at_observation`, cPoC ratio. Stored facts are still returned, and `availability["meta.compatibility"]` carries the reason.
 2. **Historical cutoff, only when compatibility is unknown.** Derived values from stored data are returned only for epochs formed no later than the last known boundary; later epochs are `unknown`. The cutoff follows the registry, not `LastUpgradeHeight`, because after two unknown upgrades that value points only to the second one.
 
-Updating the boundary registry is part of every upgrade release.
+Updating the registry is part of every upgrade release (section 7).
 
 General rules:
 
 - Missing values are never replaced with current parameters, a coefficient of 1, or zero.
-- The facade returns `capabilities`: supported sections and eras.
-- All sub-queries of a response are pinned to one height (`x-cosmos-block-height`), returned as `meta.observed_height`; the cache is keyed by it.
-- A sub-query failure makes dependent fields `unavailable`.
+- The facade returns `capabilities`: supported sections, includes, eras with their support level, and the registry.
+- Module queries of a response are pinned to one height (`x-cosmos-block-height`), returned as `meta.observed_height`. Block metadata (chain id, block time) is read with CometBFT `/header` at that height, with a full-block gRPC fallback that accepts the chain's maximum block size.
+- Mutable data is cached by height. Applied upgrade plans and genesis-only parameters can be reused for the same chain and last upgrade height, which is checked at every new observation height; with unknown compatibility genesis-only parameters stay in the height-specific cache. Failed sub-queries are never cached.
+- A sub-query failure makes dependent fields `unavailable`; chain error details are logged by edge-api, not returned.
 
 ### 5.4. Epoch state and statistics provenance
 
@@ -275,18 +277,19 @@ Epoch state is three independent properties:
 | `activation` | `upcoming` / `effective` / `past` | relative to the effective pointer |
 | `accounting` | `not_started` / `open` / `closed` / `unsettled` | `closed`: a summary exists for (participant, epoch); `not_started`: no summary, epoch `upcoming`; `open`: no summary, epoch `effective`; `unsettled`: no summary, epoch `past` |
 
-Between settlement and activation an epoch can be `effective` with `accounting = closed`. Closure is determined by summary existence, not by the pointer.
+Accounting is determined per participant; the epoch-level value is `closed` when any participant of the epoch has a summary. Between settlement and activation an epoch can be `effective` with `accounting = closed`. Closure is determined by summary existence, not by the pointer. The loaders a participant page needs are chosen from the accounting state of the participants on that page.
 
-Statistics provenance is determined per participant U in the effective epoch, from the most recent previous epoch P in which U was in `ActiveParticipants`:
+Statistics provenance is determined per participant U in the effective, open epoch, from the most recent previous epoch P in which U was in `ActiveParticipants`:
 
 | `stats_continuity` | Condition |
 |--------------------|-----------|
-| `fresh` | no P; U registered within the search window |
+| `fresh` | no P; U registered within the search window, or the search reached the first epoch |
 | `clean` | a summary exists for (U, P) |
 | `carried_over` | P exists, no summary for (U, P), P is `past` |
 | `unknown` | history not established: window limit, unavailable data, error |
+| `not_applicable` | the epoch is not effective and open |
 
-The search window is bounded to N epochs; N is calibrated by benchmark.
+The search window is 8 epochs by default (`DASHBOARD_CONTINUITY_WINDOW`). Epoch membership for the search is loaded once per observation height and epoch, and reused across pages.
 
 Availability rules:
 
@@ -295,31 +298,55 @@ Availability rules:
 | `effective`, `open`, `fresh` / `clean` | from `current_epoch_stats` | estimate from the batch query |
 | `effective`, `open`, `carried_over` | `unavailable` (`carried_from_unsettled_epoch`) | estimate with `inputs_carried_over = true` |
 | `effective`, `open`, `unknown` | `unavailable` (`provenance_unknown`) | estimate with `inputs_carried_over = null` |
-| `closed` | counters from summary; LLRs and ratio `unavailable` | finalized from summary |
+| `closed` | counters from summary; LLRs and ratio `unavailable` (`accounting_closed`) | finalized from summary |
 | `unsettled` | `unavailable` (`settlement_missing`) | `unavailable` |
-| `not_started` | `null` | `null` |
+| `not_started` | `unavailable` (`not_started`) | `unavailable` (`not_started`) |
 
-The batch estimate returns its epoch; a mismatch with the requested epoch is an error.
+With unknown compatibility, live counters are `unavailable` (`unsupported_interpretation`) and the estimate is not requested. The batch estimate returns its epoch; a mismatch with the requested epoch makes the estimate `unavailable` (`estimate_epoch_mismatch`).
 
 ### 5.5. Field availability
 
 | Value | Current epoch | Closed epochs |
 |-------|---------------|---------------|
 | Raw weight, `effective_coefficient`, `weight`, `cap_weight`, `confirmation_weight` | yes | yes |
-| Contributions, shares, `adjustment`, `confirmed_effective_weight`, `weight_to_confirm` | yes | `v0_2_16` era only |
+| Contributions, shares, eligibility, `adjustment`, formation and trust cap policy | yes | `full` and `formation` support levels |
+| `confirmed_effective_weight`, `weight_to_confirm` | yes | `full` support level |
 | cPoC ratio | per 5.4 | no |
 | Inference counters (accounting) | per 5.4 | yes, from summary |
 | Devshard counters | yes | until pruned |
 | Finalized participant reward | — | yes, when `closed` |
 | Scheduled epoch reward | yes | only with current parameters (`params_basis = observation_height`) |
-| `estimated_mintable`, reward per weight, reward estimate | `effective` + `open` only | no |
+| `estimated_mintable`, reward per weight, reward estimate, settlement cap diagnostics | `effective` + `open` only | no |
 | Actually minted epoch reward | no | no |
 | Formation and trust cap outcomes | no | no |
 | Pre-collateral weight at formation, `adjustment` breakdown | no | no |
 | Full-backing collateral threshold, projection | yes | no |
-| Status, LLRs, thresholds | as `status_at_observation` only | no |
+| Status, LLRs, thresholds | as `status_at_observation` only, `effective` + `open` | no |
 | Exclusion reason in the epoch | yes | yes |
-| H100, fee readiness | yes | no |
+| Fee readiness | yes | no |
+
+Values computed from stored inputs follow these rules:
+
+- A subgroup listed by the epoch that is absent, or an active model without subgroup membership, makes `weight_to_confirm` and `confirmed_effective_weight` `unavailable` (`confirmation_inputs_missing`). A non-excluded scale without a stored coefficient makes them `unavailable` (`coefficient_missing`); the protocol helper's fallback coefficient of 1 is not used.
+- When dynamic configs are in use, a configured model without a valid relative difficulty, or a scale without a config, makes every `compute_share_bps` and `oversupplied` `unavailable` (`difficulty_missing`), because the denominator is incomplete.
+- Arithmetic is overflow-checked. A value that does not fit is `unavailable` (`overflow`) on the affected fields only; an excluded model whose capacity overflows keeps its known zero contribution, and weight shares use a wide denominator so representable shares survive large totals.
+
+### 5.6. Chain queries
+
+| RPC | REST path | Content and bounds |
+|-----|-----------|--------------------|
+| `ActiveParticipants` | `/productscience/inference/inference/active_participants/{epoch_index}` | the stored record; `found = false` when the epoch is not formed |
+| `ActiveParticipantsSummary` | `/productscience/inference/inference/active_participants_summary/{epoch_index}` | compact per-participant, per-model aggregates: raw weight, positive weight, node count, subgroup membership and subgroup raw weight, trust weight; formation height, `cap_weight_applied`, `missing_subgroups`; optional address filter; `members_only` mode without subgroup processing; key pagination by address, at most 1000 per page |
+| `ActiveParticipantNodes` | `/productscience/inference/inference/active_participant_nodes/{epoch_index}/{participant}` | one participant's ML nodes in stored order (model order, then node order), paginated by linear offset with the total count, at most 1000 per page; the unused `timeslot_allocation` is not returned |
+| `ParticipantsBatch` | `/productscience/inference/inference/participants_batch` | compact records (address, status, join height, current-epoch statistics) for up to 1000 addresses; unbounded fields such as the inference URL are not returned |
+| `EstimateBitcoinRewards` | `/productscience/inference/inference/estimate_bitcoin_rewards` | settlement replay for all participants or up to 1000 addresses: `epoch_index`, `scheduled_reward`, `mintable_reward`, `total_full_weight`, `effective_p0`, `punishment_grace_applied`, `punishment_disabled`, settlement power-cap percentage, population and `reduced_any`, and per participant `reward_coins`, `work_coins`, `full_weight`, `confirmed_weight`, `settlement_capped_weight`, `reward_weight`, `downtime_passed`, `status` |
+| `EpochPerformanceSummaryBatch` | `/productscience/inference/inference/epoch_performance_summary_batch/{epoch_index}` | point lookups by `(participant, epoch)` for up to 1000 addresses, duplicates removed; store errors other than not-found are returned |
+| `DevshardHostEpochStatsAll` | `/productscience/inference/inference/devshard_host_epoch_stats/{epoch_index}` | prefix scan of one epoch, at most 1000 per page |
+| `GenesisOnlyParams` | `/productscience/inference/inference/genesis_only_params` | genesis-only parameters, including `max_individual_power_percentage` |
+
+`GetAllParticipantCurrentStats` fills the never-populated `effective_weight` (the confirmed weight settlement starts from: `weight × confirmation_weight / weight_to_confirm`, clamped to `weight`, before the settlement power cap, downtime test and delegation adjustments, regardless of status) and `capped_weight` (`cap_weight`); `GetParticipantCurrentStats` returns both.
+
+Paginated queries reject offset and reverse pagination and ignore `count_total`. The batch estimate and settlement load their inputs through the same function; settlement keeps its existing code path, and settlement diagnostics are collected only for the estimate query. Query handlers do not log. Node queries and filtered summaries share a query-only cache of the two most recent decoded `ActiveParticipants` records with an address index; an entry is reused only when the stored bytes are identical, concurrent misses decode once, and consensus code never reads it.
 
 ## 6. API
 
@@ -337,24 +364,24 @@ A field without which another field is ambiguous is included as a clarifying fie
 
 | # | Metric | Kind | Fields |
 |---|--------|------|--------|
-| 1 | Network weight | protocol | `network.total_weight` |
-| 2 | Host weight | protocol | `participant.weight`, `.confirmed_effective_weight`, `.cap_weight` |
-| 3 | Model | protocol | `models[].{eligible, effective_coefficient, base_coefficient, coeff_min, coeff_max, pinned, target_share_bps, compute_share_bps, pre_adjustment_weight_share_bps, raw_poc_weight, scaled_poc_capacity, eligible_contribution, ineligible_capacity, excluded_from_confirmation, oversupplied, coefficient_reduced}` |
+| 1 | Network weight | protocol | `network.total_weight`, `.participant_count` |
+| 2 | Host weight | protocol | `participant.weight`, `.confirmed_effective_weight`, `.cap_weight`, `.confirmation_weight` |
+| 3 | Model | protocol | `models[].{eligible, effective_coefficient, base_coefficient, coeff_min, coeff_max, relative_difficulty, pinned, target_share_bps, compute_share_bps, pre_adjustment_weight_share_bps, raw_poc_weight, scaled_poc_capacity, eligible_contribution, ineligible_capacity, excluded_from_confirmation, oversupplied, coefficient_reduced, participant_count, ml_node_count}` |
 | 4 | Host models and ML nodes | protocol | `participant.models[]`, `ml_nodes[]` |
 | 5 | Confirmation | protocol | `participant.weight_to_confirm`, `.confirmation_poc_ratio`, `.confirmation_poc_ratio_state` |
-| 6 | Inference statistics | protocol | `participant.inference.{accounting, devshard}`, `.stats_continuity` |
+| 6 | Inference statistics | protocol | `participant.inference.{accounting, devshard}`, `.accounting`, `.stats_continuity` |
 | 7 | Status | protocol | `participant.status_at_observation.*`, `.epoch_exclusion.*`, `.settlement_downtime.*` |
-| 8 | Epoch reward | protocol | `network.epoch_reward.{scheduled_ngonka, estimated_mintable_ngonka}`, `.reward_per_weight_unit_ngonka` |
-| 9 | Host reward | protocol | `participant.reward.{epoch_index, estimated_reward_ngonka, estimated_work_ngonka, finalized_reward_ngonka, finalized_work_ngonka, inputs_carried_over}` |
+| 8 | Epoch reward | protocol | `network.epoch_reward.{scheduled_ngonka, params_basis, estimated_mintable_ngonka, total_reward_weight}`, `.reward_per_weight_unit_ngonka` |
+| 9 | Host reward | protocol | `participant.reward.{epoch_index, mode, estimated_reward_ngonka, estimated_work_ngonka, estimated_reward_weight, finalized_reward_ngonka, finalized_work_ngonka, inputs_carried_over}` |
 | 10 | Collateral | protocol | `participant.collateral.{deposited_ngonka, full_backing_threshold_weight, grace_period_active, projection.*}` |
 | 11 | Power cap | protocol | `network.power_cap.{formation, trust, settlement}.*` |
-| 12 | H100 equivalent | convention | `/v1/dashboard/h100` |
-| 13 | Fee readiness | convention | `/v1/dashboard/participants/{address}/fee` |
+| 12 | Fee readiness | convention | `/v1/dashboard/participants/{address}/fee` |
 
 Not in v1:
 
 | Metric | Reason |
 |--------|--------|
+| H100 equivalent | a display convention built on self-reported hardware; it stays in the v0.2.16 maintainer memo |
 | Network trust weight, per-model voting power | no dashboard shows them |
 | Universal missed / invalid limits | status is decided by SPRT over stored LLRs; no single per-volume number exists |
 | Model share of actual rewards | depends on status, cPoC, settlement cap, downtime, delegations |
@@ -368,15 +395,18 @@ Not in v1:
 
 | Route | Content | Paginated |
 |-------|---------|-----------|
-| `GET /v1/dashboard/epochs/{epoch\|current}` | network, models (1, 3, 8, 11) | — |
-| `GET /v1/dashboard/epochs/{epoch\|current}/participants?include=reward,collateral,status` | participants (2, 5–10) | yes |
-| `GET /v1/dashboard/epochs/{epoch\|current}/participants/{address}` | participant with per-model breakdown | — |
-| `GET /v1/dashboard/epochs/{epoch\|current}/participants/{address}/ml-nodes` | participant ML nodes | yes |
-| `GET /v1/dashboard/h100` | H100, current epoch | — |
+| `GET /v1/dashboard/epochs/{epoch}` | epoch state, network, models (1, 3, 8, 11) | — |
+| `GET /v1/dashboard/epochs/{epoch}/participants?include=reward,collateral,status` | participants (2, 5–10) | yes |
+| `GET /v1/dashboard/epochs/{epoch}/participants/{address}` | participant with every section and the per-model breakdown | — |
+| `GET /v1/dashboard/epochs/{epoch}/participants/{address}/ml-nodes` | participant ML nodes | yes |
 | `GET /v1/dashboard/participants/{address}/fee` | fee readiness | — |
-| `GET /v1/dashboard/schema` | field registry, `capabilities` | — |
+| `GET /v1/dashboard/schema` | field registry, `capabilities`, availability reasons | — |
 
-Pagination: `limit` (default 100, max 500) and `next_token`. Participants are ordered by address, ML nodes by `(model_id, node_id)`. A token is bound to the route, participant, epoch, filters and height; continuation reuses the token's height. A token from another scope is rejected; a token whose height has been pruned returns `410 token_expired`.
+`{epoch}` is an epoch index, `current` (the effective epoch) or `latest` (the newest epoch, which is the upcoming one during PoC). Addresses are accepted in any bech32 case and normalized.
+
+Sections: the participant page returns every section; the list returns `reward`, `collateral` and `status_at_observation` only when requested with `include`. A section not requested is omitted; a requested section that is unavailable is returned with `null` fields and a reason.
+
+Pagination: `limit` (default 100, max 500) and `next_token`. Participants are ordered by address; ML nodes are returned in the participant's model order and stored node order, so the chain can seek a page by position. A token is HMAC-signed, expires after one hour and is bound to the route, participant, epoch, includes and height; continuation reuses the token's height. A tampered token or a token from another scope is rejected (`400 invalid_token`, `400 token_scope_mismatch`); an expired token or one whose height has been pruned returns `410 token_expired`. Replicas behind one balancer share the signing secret (`DASHBOARD_TOKEN_SECRET`).
 
 Envelope:
 
@@ -384,32 +414,62 @@ Envelope:
 {
   "meta": {
     "observed_height": "7037893",
+    "observed_time": "2026-11-13T12:00:00Z",
+    "chain_id": "gonka-mainnet",
     "epoch_index": "456",
     "effective_epoch_index": "456",
-    "phase": "INFERENCE",
+    "latest_epoch_index": "456",
+    "phase": "Inference",
     "interpretation_era": "v0_2_16",
+    "support_level": "full",
+    "compatibility": "known",
     "api_schema_version": "1",
-    "build": "edge-api v0.2.17 / inferenced v0.2.16-post3"
+    "build": "edge-api v0.2.17 / inferenced v0.2.17"
   },
   "data": {},
   "availability": {
-    "participants[].confirmation_poc_ratio": "current_epoch_only"
+    "network.epoch_reward.estimated_mintable_ngonka": "accounting_closed"
   },
   "next_token": null
 }
 ```
 
+Errors are `{"error": "<code>", "message": "..."}` with HTTP 400, 404, 410, 501, 502, 503 or 504.
+
 ### 6.4. JSON contract
 
-- Fractional values are decimal strings: `"0.493042733571314169"`. `Decimal{value, exponent}` is not exposed: the mantissa exceeds 2^53.
+- Fractional values are decimal strings with 18 fractional digits: `"0.493042733571314169"`. `Decimal{value, exponent}` is not exposed: the mantissa exceeds 2^53.
 - 64-bit integers (weights, heights, ngonka) are strings.
-- `*_bps` values are numbers.
-- A missing value is `null` with an explanation in `availability`; `0` means zero.
+- `*_bps` values and small counters are numbers.
+- A missing value is `null` with a reason in the nearest `availability` map: the envelope's for network and model fields, the participant object's for participant fields. Per-item reasons use the item key, for example `models[<model_id>].compute_share_bps`, `ml_nodes[<model_id>].scaled_poc_capacity` or `keys[<warm_address>].usable_ngonka`. `0` means zero.
 - The facade does not use `coerceProtoJSONNumbers`.
+- `openapi.yaml` describes every response; the schemas are checked against the Go response types and the field registry.
+
+Availability reasons:
+
+| Reason | Meaning |
+|--------|---------|
+| `current_epoch_only` | the value exists only for the effective epoch |
+| `accounting_open`, `accounting_closed`, `accounting_not_open` | the epoch is not settled yet, already settled, or not open |
+| `not_started` | the epoch has not become effective |
+| `settlement_missing` | the epoch is past but its summary does not exist |
+| `carried_from_unsettled_epoch`, `provenance_unknown` | live counters still include an unsettled epoch, or their origin is not established |
+| `era_not_supported`, `unsupported_interpretation` | the era does not support the value, or the chain applied an upgrade this build does not know |
+| `epoch_not_formed`, `coefficient_not_computed` | formation has not happened yet |
+| `confirmation_inputs_missing`, `coefficient_missing`, `difficulty_missing` | a stored input the calculation needs is absent |
+| `no_dynamic_config`, `no_positive_capacity`, `not_applicable` | the model has no frozen dynamic config, has no positive raw capacity, or the field does not apply |
+| `no_event_yet` | no confirmation PoC event in this epoch yet |
+| `pruned` | the chain no longer keeps the data |
+| `overflow` | the value does not fit in 64 bits |
+| `query_failed`, `estimate_epoch_mismatch` | a sub-query failed or answered for another epoch |
+| `grace_period`, `base_weight_ratio_full`, `unbounded`, `invalid_params` | the collateral threshold cannot be expressed |
+| `genesis_params_missing`, `power_cap_disabled` | the power-cap policy cannot be determined or does not apply |
+| `budget_unknown`, `unsupported_allowance`, `truncated` | fee inputs are incomplete, use an allowance type the facade does not evaluate, or exceed the route's budget |
+| `zero_denominator` | a ratio has no denominator |
 
 ### 6.5. Field definitions
 
-The field registry in `dashboardcalc` stores, for each field, its source, scope, units, rounding, availability, eras, kind and calculation function. `/v1/dashboard/schema`, documentation and part of the tests are generated from it.
+The field registry in `dashboardcalc` stores, for each field, its route, path, source (`meta`, `stored`, `formation`, `settlement`, `current_rules`, `convention`), type, unit, rounding, eras, availability, kind and calculation function. `/v1/dashboard/schema`, documentation and part of the tests are generated from it; every emitted path is in the registry and every registered path is emitted.
 
 **Weight and models**
 
@@ -419,17 +479,20 @@ The field registry in `dashboardcalc` stores, for each field, its source, scope,
 | `ml_nodes[].scaled_poc_capacity` | `trunc(effective_coeff_m × raw_poc_weight)`; capacity, not contribution |
 | `participant.models[].scaled_poc_capacity` | `trunc(effective_coeff_m × Σ raw_poc_weight)` for any model |
 | `participant.models[].eligible_contribution` | the same for eligible models only (`delegation_weight_calculator.go:294, 324`); 0 for an ineligible model |
-| `models[].eligible` | model eligibility for the epoch, decided per model. `exclude_from_confirmation` is set when the model is ineligible **or** has no positive-weight PoC nodes (`confirmation_weight_scales.go:23, 67`; `confirmation_weight_scales_test.go:42`). With positive raw capacity, `eligible = !exclude_from_confirmation`; with zero raw capacity, `eligible = null`, and contributions are zero either way |
+| `models[].effective_coefficient` | the stored `effective_coefficient`, or `weight_scale_factor` for epochs formed before v0.2.16 |
+| `models[].pinned` | `coeff_min = coeff_max` on the epoch's frozen config |
+| `models[].eligible` | model eligibility for the epoch, decided per model. `exclude_from_confirmation` is set when the model is ineligible **or** has no positive-weight PoC nodes (`confirmation_weight_scales.go:23, 67`; `confirmation_weight_scales_test.go:42`). With positive raw capacity, `eligible = !exclude_from_confirmation`; a model without a scale is ineligible; with zero raw capacity, `eligible = null`, and contributions are zero either way |
+| `models[].raw_poc_weight` | sum of positive `poc_weight`, as the coefficient controller counts it |
 | `models[].scaled_poc_capacity`, `.eligible_contribution` | sums of per-participant truncated values |
 | `models[].ineligible_capacity` | `scaled_poc_capacity − eligible_contribution` |
 | `adjustment` | `weight − Σ eligible_contribution`: group cap, collateral, power cap |
 | `weight` | `ActiveParticipant.weight` |
 | `cap_weight` | `ActiveParticipant.cap_weight`; equals `weight` for epochs before v0.2.16 |
-| `confirmed_effective_weight` | `types.EffectiveConfirmedWeight` |
-| `weight_to_confirm` | `types.ConfirmationWeightOfParticipant`, excluding models with `exclude_from_confirmation` |
-| `compute_share_bps` | `floor(10000 × D_m × raw_m / Σ D × raw)` across all models; `null` when the denominator is zero |
+| `confirmed_effective_weight` | the settlement confirmed weight: `types.EffectiveConfirmedWeight` over the subgroup nodes, clamped to `weight`; `weight` when the epoch has no scales |
+| `weight_to_confirm` | `types.ConfirmationWeightOfModelNodes` over the participant's subgroup nodes, excluding models with `exclude_from_confirmation` |
+| `compute_share_bps` | `floor(10000 × D_m × raw_m / Σ D × raw)` across configured models; `null` when the denominator is zero or incomplete |
 | `pre_adjustment_weight_share_bps` | `floor(10000 × eligible_contribution_m / Σ eligible_contribution)`; not a share of rewards |
-| `oversupplied` | the controller's unrounded cross-product comparison (`coefficients.go:425`) |
+| `oversupplied` | the controller's unrounded cross-product comparison of the compute share with the target (`coefficients.go:425`) |
 | `coefficient_reduced` | `effective_coefficient < base_coefficient`; always `false` when `pinned` |
 
 **Confirmation, statistics, status**
@@ -438,11 +501,12 @@ The field registry in `dashboardcalc` stores, for each field, its source, scope,
 |-------|------------|
 | `confirmation_poc_ratio` | `current_epoch_stats.confirmationPoCRatio`, per the rules in 5.4 |
 | `confirmation_poc_ratio_state` | `measured` / `no_event_yet` / `unavailable` |
-| `inference.accounting` | `{inference_count, missed, validated_inferences, invalidated_inferences, final}` from the summary or `current_epoch_stats` |
-| `inference.devshard` | `{missed, invalid, required_validations, completed_validations, cost_ngonka, escrow_count}` from `DevshardHostEpochStats`; `null` after pruning |
-| `stats_continuity` | `fresh` / `clean` / `carried_over` / `unknown` |
+| `accounting` | the participant's accounting state (5.4) |
+| `inference.accounting` | `{source, final, inference_count, missed, validated_inferences, invalidated_inferences}` from the summary (`final = true`) or `current_epoch_stats` |
+| `inference.devshard` | `{missed, invalid, required_validations, completed_validations, cost_ngonka, escrow_count}` from `DevshardHostEpochStats`; a missing record is zero while the epoch is within the two-epoch retention or another participant has a record for it, otherwise `null` (`pruned`) |
+| `stats_continuity` | `fresh` / `clean` / `carried_over` / `unknown` / `not_applicable` |
 | `status_at_observation` | `{status, invalid_llr, invalid_threshold, inactive_llr, inactive_threshold, observed_height}`; the participant record at the observation height, not epoch history |
-| `epoch_exclusion` | `{excluded, reason}` from the epoch's `ExcludedParticipants`; without a record, `excluded = false`, `reason = null` |
+| `epoch_exclusion` | `{excluded, reason, exclusion_block_height}` from the epoch's `ExcludedParticipants`; without a record, `excluded = false`, `reason = null` |
 | `settlement_downtime` | `{effective_p0, punishment_grace_applied, punishment_disabled, eligible_at_observation}` from the batch reward query; an assessment at the observation height |
 
 **Rewards**
@@ -451,9 +515,10 @@ The field registry in `dashboardcalc` stores, for each field, its source, scope,
 |-------|------------|
 | `network.epoch_reward.scheduled_ngonka` | schedule function with observation-height parameters; `params_basis = "observation_height"` |
 | `network.epoch_reward.estimated_mintable_ngonka` | `min(scheduled, StandardRewardAmount − total_subsidies)`, only when `effective` + `open` |
-| `network.reward_per_weight_unit_ngonka` | `estimated_mintable / Σ fullWeight`, only when `effective` + `open`; nominal rate |
-| `reward.epoch_index` | epoch of the batch estimate |
-| `reward.estimated_reward_ngonka`, `estimated_work_ngonka` | `SettleAmount.RewardCoins`, `WorkCoins` |
+| `network.epoch_reward.total_reward_weight` | the settlement denominator: full weights including inactive participants |
+| `network.reward_per_weight_unit_ngonka` | `estimated_mintable / total_reward_weight`, only when `effective` + `open`; nominal rate |
+| `reward.epoch_index`, `reward.mode` | epoch of the estimate or summary; `estimate` or `finalized` |
+| `reward.estimated_reward_ngonka`, `estimated_work_ngonka`, `estimated_reward_weight` | `SettleAmount.RewardCoins`, `WorkCoins`, and the reward weight after confirmation, settlement cap, downtime and delegation adjustments |
 | `reward.finalized_reward_ngonka`, `finalized_work_ngonka` | `EpochPerformanceSummary.rewarded_coins`, `earned_coins` |
 
 **Collateral**
@@ -461,114 +526,114 @@ The field registry in `dashboardcalc` stores, for each field, its source, scope,
 | Field | Definition |
 |-------|------------|
 | `collateral.grace_period_active` | `latest_epoch ≤ grace_period_end_epoch` |
-| `collateral.full_backing_threshold_weight` | the largest weight the deposit fully backs: grace → `null`; `bwr = 1` → `null`; `cpwu = 0` → `null` with a positive deposit, `0` with a zero deposit; otherwise `floor(deposited / cpwu / (1 − bwr))` |
+| `collateral.full_backing_threshold_weight` | the largest weight the deposit fully backs: grace → `null`; `bwr = 1` → `null`; `cpwu = 0` → `null` with a positive deposit, `0` with a zero deposit; otherwise `floor(deposited / cpwu / (1 − bwr))`, corrected against the collateral formula so that the returned weight is fully backed and the next one is not |
 | `collateral.projection.input_weight` | the participant's `Σ eligible_contribution` in the current epoch |
-| `collateral.projection.projected_post_collateral_weight` | weight after collateral, before the power cap: grace → `input`; `input = 0` → 0; `bwr = 1` → `input`; `cpwu = 0` → `input` with a positive deposit, `trunc(input × bwr)` with a zero deposit; otherwise `trunc(input × bwr + min(input × (1 − bwr), deposited / cpwu))` |
-| `collateral.projection.{target_epoch, assumptions}` | the next epoch; current parameters and deposit, no group caps, no hardware changes |
+| `collateral.projection.projected_post_collateral_weight` | weight after collateral, before the power cap: grace (for the target epoch) → `input`; `input = 0` → 0; `bwr = 1` → `input`; `cpwu = 0` → `input` with a positive deposit, `trunc(input × bwr)` with a zero deposit; otherwise `trunc(input × bwr + min(input × (1 − bwr), deposited / cpwu))` |
+| `collateral.projection.{target_epoch, assumptions}` | the next epoch; current parameters and deposit, no group caps, no delegation adjustments, no power cap, no hardware changes |
 
 **Power cap**
 
 | Field | Definition |
 |-------|------------|
-| `power_cap.formation` | `enabled = max_individual_power_percentage ≠ 0`; population: `weight` of the epoch's participants; 30%, or 50% / 40% for 2 / 3 participants |
+| `power_cap.formation` | `enabled = max_individual_power_percentage ≠ 0`; population: `weight` of the epoch's participants; 30%, or 50% / 40% for 2 / 3 participants with positive weight; `positive_count` and `max_percentage` need formation support |
 | `power_cap.trust` | the same policy applied to the `cap_weight` vector |
-| `power_cap.settlement` | no genesis-parameter check; population: positive confirmed weights of ACTIVE participants |
-| `power_cap.settlement.estimated_reduced_any` | whether the settlement cap would reduce any weight with the current inputs |
+| `power_cap.settlement` | no genesis-parameter check; population: positive confirmed weights of ACTIVE participants; `positive_count`, `max_percentage` and `estimated_reduced_any` from the batch estimate |
 
 **Display conventions**
 
 | Field | Definition |
 |-------|------------|
-| `h100` | `{epoch_index, equivalent, weight_per_h100, reference_card, algorithm_version, sample: {nodes, cards, models[], mixed_hosts_included}, self_reported_hardware: true}`. v0.2.16 memo algorithm: median of `poc_weight × effective_coefficient / cards` over `NVIDIA H100 80GB HBM3` nodes in `INFERENCE` status with `poc_weight > 0` on active validators; `equivalent = total_weight / weight_per_h100`; an empty sample gives `null` |
-| `fee` | `{cold_address, keys[], cold_spendable_ngonka, warm_spendable_ngonka, has_funded_operational_key, epoch_budget, issued_grants_mismatch}` |
-| `fee.keys[]` | per warm key: `{warm_address, message_permissions: {store_commit, hardware_diff}, allowance: {type, spend_limit_ngonka, expiration, expired, supported}, authorized, usable_ngonka}`. A missing or expired grant gives `authorized = false`, `usable = 0`. A valid BasicAllowance with an empty limit gives `usable = cold_spendable`, otherwise `min(cold_spendable, spend_limit)`. `PeriodicAllowance` and `AllowedMsgAllowance` give `supported = false`, `usable = null`. authz and feegrant expirations are checked separately against block time |
-| `fee.has_funded_operational_key` | a key exists with both valid permissions, `authorized = true`, `usable > 0` |
-| `fee.epoch_budget` | `{fees_enabled, budget_known, budget_ngonka, covers_budget, assumptions}` from a shared function extracted from the dapi estimator. Fees disabled → `covers_budget = true`; budget unknown → `null` |
+| `fee` | `{cold_address, epoch_index, epoch_member, keys[], cold_spendable_ngonka, warm_spendable_ngonka, has_funded_operational_key, epoch_budget, issued_grants_mismatch, issued_grantees}` |
+| `fee.keys[]` | per warm key with a valid authz grant for `MsgPoCV2StoreCommit` or `MsgSubmitHardwareDiff`: `{warm_address, message_permissions: {store_commit, hardware_diff}, allowance: {type, spend_limit_ngonka, expiration, expired, supported}, authorized, usable_ngonka, warm_spendable_ngonka}`. A missing or expired grant gives `authorized = false`, `usable = 0`. A valid BasicAllowance with an empty limit gives `usable = cold_spendable`, otherwise `min(cold_spendable, spend_limit)`. `PeriodicAllowance` and `AllowedMsgAllowance` give `supported = false`, `usable = null` (`unsupported_allowance`). authz and feegrant expirations are checked separately against block time |
+| `fee.has_funded_operational_key` | `true` when a key has both permissions, `authorized = true` and `usable > 0`; `null` (`unsupported_allowance`) when such a key's usable amount cannot be evaluated; `null` (`truncated`) when the listings were incomplete; `false` otherwise |
+| `fee.warm_spendable_ngonka` | sum over displayed keys; never counted as usable; `null` when keys were truncated |
+| `fee.issued_grants_mismatch` | the cold account issued an allowance to a non-operational grantee while an operational key has no valid allowance; `null` when the listings were incomplete |
+| `fee.epoch_budget` | `{fees_enabled, budget_known, budget_ngonka, covers_budget, count_source, count, serving_models, assumptions}` from the fee-budget function shared with the dapi estimator. The count is the participant's own StoreCommits in the latest PoC stage, or the top participant's when it has none. Fees disabled → `covers_budget = true`; budget unknown → `null`; `covers_budget` is `true` when an evaluated allowance covers the budget, `null` when an operational key's allowance cannot be evaluated or the listings were incomplete, otherwise `false` |
 
-### 6.6. Performance
+### 6.6. Performance and resource bounds
 
-- The batch reward estimate reads only the requested epoch's subgroups by `(epoch, model)` key instead of `GetAllEpochGroupData`, and builds address maps once.
-- Summaries are read by point lookup on `(participant, epoch)` for the participant page.
-- Hardware is read only for the relevant participants.
-- The reward estimate is enabled with `include=reward` and cached by height.
-- ML nodes are served from a separate paginated route.
+- Every chain loader is memoized by observation height and shared between concurrent requests. Each shared operation owns a bounded, height-pinned work context, so a disconnecting caller only stops its own wait; a panic inside shared work is contained and returned as an error. Each request has a 30-second deadline.
+- The epoch view is built from paginated compact summaries, never from the nested `ActiveParticipants` record, so no single response depends on the epoch's size.
+- Participant records, provenance and devshard statistics are loaded for the requested page only; records are trimmed to the fields the dashboard reads before caching.
+- ML nodes are loaded in fixed 500-node chunks on demand, into a separate node cache bounded by size (32 MB) with least-recently-used eviction, so `limit=1` costs one chunk and old heights age out.
+- The fee route reads one page (1000) of grants and allowances, displays at most 16 operational keys and looks up allowances of displayed keys missing from a truncated listing; the stage's StoreCommit snapshot is loaded once per height and shared by all fee requests.
+- Hardware data is not read.
 - Gas limits and timeouts are set from a benchmark on a mainnet state snapshot.
 - `module_query_safe` and Wasm access are not part of v1.
 
 ## 7. Upgrade process
 
 1. Behavioral fixtures for each era at upgrade and epoch boundaries, not only schema checks.
-2. Separate H100 fixtures for each sampling-algorithm version.
-3. Updating the facade's upgrade boundary registry is part of every upgrade release.
-4. A "Dashboard changes" section in each upgrade README: changed fields, the new era, activation height, cache instructions.
-5. A named owner keeps the maintainer list and collects acknowledgements before the upgrade height.
-6. The facade runs on the rehearsal testnet before mainnet for dashboard smoke tests.
-7. A deprecated field stays for at least one upgrade, marked `deprecated`.
+2. Updating the facade's upgrade registry is part of every upgrade release. A test fails while a tracked upgrade handler is neither in the registry nor listed as pending.
+3. A "Dashboard changes" section in each upgrade README: changed fields, the new era, activation height, cache instructions.
+4. A named owner keeps the maintainer list and collects acknowledgements before the upgrade height.
+5. The facade runs on the rehearsal testnet before mainnet for dashboard smoke tests.
+6. A deprecated field stays for at least one upgrade, marked `deprecated`.
 
 ## 8. Implementation plan
 
-**Stage 1. Registry and contract**
+**Stage 1. Shared package and contract**
 
-- `dashboardcalc` package: field registry, eras, availability rules.
-- Extract contributions, sums, shares, `oversupplied` and `adjustment` into pure functions; the pipeline switches to them without behavior change.
-- JSON contract and fixtures.
+- `dashboardcalc`: field registry, eras, availability rules, epoch view.
+- Extract contributions, sums, shares, `oversupplied`, `adjustment`, collateral, power cap, reward schedule, supply cap and the fee budget into pure functions; the weight pipeline, settlement, collateral adjustment and the dapi estimator switch to them without behavior change.
+- JSON contract and behavioral fixtures.
+- This design document in `proposals/dashboard-api/`.
 
 **Stage 2. Chain queries (patch release)**
 
-- `ActiveParticipants(epoch_index)`.
-- Batch reward estimate: epoch, `RewardCoins`, `WorkCoins`, settlement diagnostics from the same inputs.
-- Batch point lookups of `EpochPerformanceSummary`.
-- `DevshardHostEpochStats` for all participants of an epoch.
-- `GenesisOnlyParams`.
+- The queries in section 5.6.
 - Populate `effective_weight` and `capped_weight` in `GetAllParticipantCurrentStats`; add these fields to `GetParticipantCurrentStats`.
-- Document the meaning of `current_epoch_stats` in the proto.
 
 **Stage 3. Facade**
 
-- Routes, envelope, `capabilities`, single height, cache, unknown-upgrade guard.
-- H100 and fee readiness.
-- `openapi.yaml`, `docs/dashboard-api.md`, a memo in `gonka-docs`.
+- Routes, envelope, `capabilities`, single height, caching, unknown-upgrade guard, signed pagination.
+- Fee readiness.
+- `openapi.yaml` and proxy routes.
 
-**Stage 4. Process**: section 7, from the next upgrade.
+**Stage 4. Documentation and rollout**
 
-**Later**: formation and settlement snapshots in state if exact history is needed; on-chain queries for direct and Wasm access.
+- `docs/dashboard-api.md` for maintainers, including the meaning of `current_epoch_stats`, and a memo in `gonka-docs`.
+- A benchmark on a mainnet state snapshot.
+- Testermint runs on a fresh cluster and before and after an upgrade.
+- The process in section 7, from the next upgrade.
+
+**Later**: formation and settlement snapshots in state if exact history is needed; a per-participant node index in state; on-chain queries for direct and Wasm access.
 
 **Tests**
 
-- Equivalence: the estimate equals `RewardCoins` and `WorkCoins` of the actual settlement; the pipeline and the facade produce identical contributions.
-- Eras: upgrade during PoC, upcoming epoch without `effective_coefficient`, pinned model, and the normal path: a compatible chain with an epoch formed long after the latest known upgrade stays `v0_2_16`.
+- Equivalence: the estimate equals `RewardCoins`, `WorkCoins` and the minted amount of the actual settlement; the pipeline and the facade produce identical contributions; randomized comparison of the reward calculation before and after the extraction.
+- Eras: upgrade during PoC, upcoming epoch without `effective_coefficient`, pinned model, genesis chain, and the normal path: a compatible chain with an epoch formed long after the latest known upgrade stays fully supported.
 - Unknown upgrade: a new upgrade with unchanged answers for known names; an upgrade during an effective epoch; two upgrades in a row.
-- Epoch state: settlement–activation overlap; failed settlement followed by activation.
+- Epoch state: settlement–activation overlap; failed settlement followed by activation; mixed accounting on one page.
 - Statistics provenance: `fresh`, `clean`, `carried_over` after an absence, `unknown` beyond the window.
 - Historical status: a closed epoch does not return the current status and LLRs.
 - Model eligibility: ineligible model with positive raw weight; eligible model without positive-weight nodes (`eligible = null`, zero contribution).
+- Missing inputs and overflow: missing subgroup, missing coefficient, missing difficulty or config, overflowing capacities and shares.
 - Rewards: subsidy exhaustion, schedule parameter change.
-- Collateral: grace, `bwr = 1`, `input = 0`, `cpwu = 0` with zero and positive deposits.
-- Fee: expired and multiple grants, disabled fees, unknown budget, expired authz with a valid feegrant.
-- Pagination: a token with a pruned height.
-- JSON: values above 2^53, `null`, omitted and zero fields.
-- Benchmark of batch queries; Testermint before and after an upgrade.
+- Collateral: grace, `bwr = 1`, `input = 0`, `cpwu = 0` with zero and positive deposits; the threshold against the collateral formula.
+- Fee: expired and multiple grants, disabled fees, unknown budget, expired authz with a valid feegrant, unsupported allowance types, truncated listings.
+- Pagination: tampered, foreign-scope, expired and pruned-height tokens; node chunks across varying limits.
+- Resources: concurrent requests, caller cancellation, large epochs, large participants, large blocks.
+- JSON: values above 2^53, `null`, omitted and zero fields; responses validated against `openapi.yaml`.
 
 ## 9. Open questions
 
-1. Verify the `full_backing_threshold_weight` formula against code and fixtures.
-2. The value of N for the previous-participation search window.
-3. Location of `dashboardcalc`: `x/inference/types/dashboard` or a separate package.
-4. Whether formation and settlement snapshots in state are needed, and for which fields.
-5. The owner of maintainer communication.
-6. Which nodes are guaranteed to serve the facade during release rollout.
-7. Whether an APR estimate is needed.
+1. Whether formation and settlement snapshots in state are needed, and for which fields.
+2. The owner of maintainer communication.
+3. Which nodes are guaranteed to serve the facade during release rollout.
+4. Whether an APR estimate is needed.
+5. The continuity search window and gas limits, to be calibrated on a mainnet snapshot.
 
 ## 10. References
 
 Code (`inference-chain/`):
 
-- `x/inference/module/`: `module.go`, `chainvalidation.go`, `delegation_weight_calculator.go`, `delegation_pipeline.go`, `previous_epoch_cap.go`, `power_capping.go`, `confirmation_poc.go`, `poc_challenge.go`
+- `x/inference/module/`: `module.go`, `chainvalidation.go`, `delegation_weight_calculator.go`, `delegation_pipeline.go`, `previous_epoch_cap.go`, `power_capping.go`, `confirmation_poc.go`, `confirmation_weight_scales.go`, `poc_challenge.go`
 - `x/inference/keeper/`: `collateral.go`, `bitcoin_rewards.go`, `accountsettle.go`, `msg_server_settle_devshard_escrow.go`, `devshard_host_stats.go`, `pruning.go`, `participant_status.go`, `query_bitcoin_reward_estimate.go`, `query_epoch_performance_summary.go`, `partial_upgrade.go`
 - `x/inference/types/weight.go`, `x/inference/coefficients/coefficients.go`, `x/inference/calculations/status.go`
 - `proto/inference/inference/`: `epoch_group_data.proto`, `activeparticipants.proto`, `params.proto`, `query.proto`, `participant.proto`, `epoch_performance_summary.proto`, `excluded_participant.proto`
-- `app/upgrade_tracking.go`, `app/legacy.go`, `app/upgrades/v0_2_16/upgrades.go`
-- `common/queryapi/`, `decentralized-api/internal/server/admin/epoch_fee_budget.go`
+- `app/upgrade_tracking.go`, `app/legacy.go`, `app/upgrades/v0_2_16/upgrades.go`, `app/upgrades/v0_2_17/upgrades.go`
+- `common/queryapi/`, `common/chain/`, `proxy/entrypoint.sh`, `decentralized-api/internal/server/admin/epoch_fee_budget.go`
 
 Documents:
 
